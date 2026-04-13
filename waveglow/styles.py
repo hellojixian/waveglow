@@ -629,7 +629,7 @@ class GlowBottomWaveStyle:
         amp   = self._smoothed_amp
         t_amp = min(amp * 2.0, 1.0)
 
-        frame_alpha = 0.15 * t_amp   # 0–15%
+        frame_alpha = 0.04 * t_amp   # 0–4% (glow only)
 
         # Color lerp
         r1,g1,b1 = self.color;  r2,g2,b2 = self.color2
@@ -674,7 +674,9 @@ class GlowBottomWaveStyle:
             wave_alpha_gpu = wave_alpha_gpu + line_mask * weight
 
         wave_alpha_gpu = wave_alpha_gpu.clamp(0.0, 1.0)
-        alpha_wave = wave_alpha_gpu * frame_alpha * 0.8
+        # Wave uses independent brighter alpha (0–80%), not tied to dim glow alpha
+        wave_frame_alpha = 0.8 * t_amp
+        alpha_wave = wave_alpha_gpu * wave_frame_alpha
 
         # ---- Combine ----
         alpha_combined = torch.maximum(alpha_glow, alpha_wave).clamp(0.0, 1.0)
@@ -729,7 +731,8 @@ class GlowBottomWaveStyle:
             wave_alpha += np.exp(-0.5 * (dist_px / sigma) ** 2) * weight
 
         wave_alpha = np.clip(wave_alpha, 0.0, 1.0)
-        alpha_wave = wave_alpha * frame_alpha * 0.8
+        wave_frame_alpha = 0.8 * t_amp
+        alpha_wave = wave_alpha * wave_frame_alpha
 
         alpha_combined = np.clip(np.maximum(alpha_glow, alpha_wave), 0.0, 1.0)
         alpha_arr = (alpha_combined * 255).astype(np.uint8)
