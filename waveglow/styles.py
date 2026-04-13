@@ -389,3 +389,22 @@ class GlowEdgeStyle:
         rgba[:, :, 3] = alpha_arr
 
         return Image.fromarray(rgba, mode="RGBA")
+
+
+class GlowTopBottomStyle(GlowEdgeStyle):
+    """
+    Same breathing glow as GlowEdgeStyle but emitting from top and bottom edges.
+    """
+
+    def _get_dist_x(self, W, H):
+        """Top-bottom distance field (reuses parent smootherstep + caching)."""
+        if self._cache_shape != (W, H):
+            y_idx = np.arange(H, dtype=np.float32)
+            # Normalised distance from top/bottom edge: 0=edge, 1=center
+            dist_top    = y_idx / (H * 0.5)
+            dist_bottom = (H - 1 - y_idx) / (H * 0.5)
+            dist_y = np.minimum(dist_top, dist_bottom)  # (H,)
+            # Broadcast to (H, W)
+            self._dist_x_cache = np.broadcast_to(dist_y[:, np.newaxis], (H, W)).copy()
+            self._cache_shape = (W, H)
+        return self._dist_x_cache
