@@ -591,13 +591,14 @@ class GlowBottomWaveStyle:
         self._n_lines = 6
 
         # Line configs: (y_base_frac_from_bottom, sigma_px, weight)
+        # y_base_frac=0.5 puts lines at vertical center of frame
         self._line_cfgs = [
-            (0.06, 3.0, 1.00),
-            (0.06, 8.0, 0.40),
-            (0.10, 2.0, 0.65),
-            (0.10, 6.0, 0.25),
-            (0.03, 1.5, 0.50),
-            (0.13, 1.5, 0.30),
+            (0.50, 3.0, 1.00),
+            (0.50, 8.0, 0.40),
+            (0.52, 2.0, 0.65),
+            (0.52, 6.0, 0.25),
+            (0.48, 1.5, 0.50),
+            (0.54, 1.5, 0.30),
         ]
 
     def _get_dist_cache(self, W, H):
