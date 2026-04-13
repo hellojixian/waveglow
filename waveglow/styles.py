@@ -96,7 +96,7 @@ class PlasmaStyle:
         breath = 0.5 + 0.5 * math.sin(t * 1.8 + line_idx * 0.9)
         # Amplitude reactivity
         amp_boost = 1.0 + amplitude * 1.5
-        # Combine
+        # Combine — minimum 1px so line never disappears during silence
         w = base_w * center_envelope * amp_boost * (0.7 + 0.3 * breath)
         return max(1, int(round(w)))
 
@@ -109,12 +109,14 @@ class PlasmaStyle:
         def wave_y(x, phase, freq, amp_mult):
             tx = x / W
             edge = min(tx * 5, (1 - tx) * 5, 1.0)
+            # amplitude=0 → flat line at center; amplitude>0 → full wave
+            eff_amp = amplitude * amp_mult
             y = (
                 math.sin(tx * math.pi * 3.5 * freq + t + phase) * 0.50 +
                 math.sin(tx * math.pi * 7.1 * freq + t * 1.4 + phase * 2.1) * 0.28 +
                 math.sin(tx * math.pi * 1.8 * freq + t * 0.6 + phase * 0.7) * 0.22
             )
-            return int(cy + y * wave_h * amp_mult * edge)
+            return int(cy + y * wave_h * eff_amp * edge)
 
         glow_scales = self._glow_layers(self.glow)
         step = 3  # x pixel step — balance quality vs speed
@@ -128,7 +130,9 @@ class PlasmaStyle:
                 y = max(1, min(H - 2, y))
                 pts.append((x, y))
 
-            effective_alpha = int(255 * base_alpha * min(amplitude * 1.8, 1.0))
+            # Keep a minimum alpha so lines stay visible during silence
+            min_alpha = int(255 * base_alpha * 0.25)
+            effective_alpha = max(min_alpha, int(255 * base_alpha * min(amplitude * 1.8, 1.0)))
 
             for blur_r, a_mult in glow_scales:
                 a = min(int(effective_alpha * a_mult), 255)
