@@ -245,6 +245,17 @@ class WaveGlow:
             # Pre-compute PCM window size for real-waveform styles
             pcm_win_samples = int(sr / self.fps)  # samples per frame
 
+            # Fast path: glow-bottom-wave on GPU — use render_frame_bytes() to skip PIL
+            use_fast_bytes = (
+                self.style_name == "glow-bottom-wave"
+                and hasattr(self.renderer, "render_frame_bytes")
+                and getattr(self.renderer, "_device", None) is not None
+                and getattr(self.renderer._device, "type", "cpu") == "cuda"
+                and self.opacity >= 1.0
+            )
+            if use_fast_bytes:
+                print("[WaveGlow] GPU fast-path: render_frame_bytes (no PIL)")
+
             for fi in tqdm(range(n_frames), unit=" frames", ncols=80):
                 amp = float(rms[fi]) if fi < len(rms) else 0.0
                 amp = min(amp * 2.0, 1.0)
@@ -252,24 +263,32 @@ class WaveGlow:
                 if self.style_name == "bars":
                     fft_frame = fft[fi] if fi < len(fft) else np.zeros(80)
                     frame = self.renderer.render_frame(fi, fft_frame, width, height, self.fps)
+                    ff_proc.stdin.write(frame.tobytes())
                 elif self.style_name == "envelope":
                     frame = self.renderer.render_frame(fi, env, width, height, self.fps)
+                    ff_proc.stdin.write(frame.tobytes())
                 elif self.style_name == "glow-bottom-wave":
-                    # Pass real PCM window so wave shape matches actual audio
                     start = fi * pcm_win_samples
                     end   = start + pcm_win_samples
                     pcm_win = wav[start:end] if start < len(wav) else np.zeros(pcm_win_samples)
-                    frame = self.renderer.render_frame(fi, amp, width, height, self.fps, pcm_window=pcm_win)
+                    if use_fast_bytes:
+                        # ✅ Zero-copy GPU path: returns raw bytes, no PIL roundtrip
+                        raw = self.renderer.render_frame_bytes(fi, amp, width, height, self.fps, pcm_window=pcm_win)
+                        ff_proc.stdin.write(raw)
+                    else:
+                        frame = self.renderer.render_frame(fi, amp, width, height, self.fps, pcm_window=pcm_win)
+                        if self.opacity < 1.0:
+                            r, g, b, a = frame.split()
+                            a = a.point(lambda x: int(x * self.opacity))
+                            frame = Image.merge("RGBA", (r, g, b, a))
+                        ff_proc.stdin.write(frame.tobytes())
                 else:
                     frame = self.renderer.render_frame(fi, amp, width, height, self.fps)
-
-                if self.opacity < 1.0:
-                    r, g, b, a = frame.split()
-                    a = a.point(lambda x: int(x * self.opacity))
-                    frame = Image.merge("RGBA", (r, g, b, a))
-
-                # Pipe raw RGBA bytes directly to ffmpeg (no disk I/O)
-                ff_proc.stdin.write(frame.tobytes())
+                    if self.opacity < 1.0:
+                        r, g, b, a = frame.split()
+                        a = a.point(lambda x: int(x * self.opacity))
+                        frame = Image.merge("RGBA", (r, g, b, a))
+                    ff_proc.stdin.write(frame.tobytes())
 
             ff_proc.stdin.close()
             ff_proc.wait()

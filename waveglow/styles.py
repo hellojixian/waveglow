@@ -622,9 +622,17 @@ class GlowBottomWaveStyle:
         return self._dist_cache
 
     def render_frame(self, fi, amplitude, W, H, fps=30, pcm_window=None):
+        """Returns PIL Image (for compatibility) or raw bytes — see render_frame_bytes."""
         if self._torch is not None and self._device.type == "cuda":
             return self._render_gpu(fi, amplitude, W, H, fps, pcm_window)
         return self._render_cpu(fi, amplitude, W, H, fps, pcm_window)
+
+    def render_frame_bytes(self, fi, amplitude, W, H, fps=30, pcm_window=None):
+        """Like render_frame but returns raw RGBA bytes directly (zero-copy GPU path)."""
+        if self._torch is not None and self._device.type == "cuda":
+            return self._render_gpu_bytes(fi, amplitude, W, H, fps, pcm_window)
+        frame = self._render_cpu(fi, amplitude, W, H, fps, pcm_window)
+        return frame.tobytes()
 
     def _render_gpu(self, fi, amplitude, W, H, fps, pcm_window=None):
         torch = self._torch
@@ -700,6 +708,68 @@ class GlowBottomWaveStyle:
 
         rgba_np = rgba_gpu.cpu().numpy()
         return Image.fromarray(rgba_np, mode="RGBA")
+
+    def _render_gpu_bytes(self, fi, amplitude, W, H, fps, pcm_window=None):
+        """GPU-accelerated render returning raw RGBA bytes — skips PIL entirely."""
+        torch = self._torch
+        dev   = self._device
+
+        self._smoothed_amp += self._ema_alpha * (amplitude - self._smoothed_amp)
+        amp   = self._smoothed_amp
+        t_amp = min(amp * 2.0, 1.0)
+
+        frame_alpha = 0.08 * t_amp
+
+        r1,g1,b1 = self.color;  r2,g2,b2 = self.color2
+        cr = (r1 + (r2-r1)*t_amp) * 255
+        cg = (g1 + (g2-g1)*t_amp) * 255
+        cb = (b1 + (b2-b1)*t_amp) * 255
+
+        dist_field = self._get_dist_cache(W, H)
+        reach_base = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40
+        reach = reach_base * (0.3 + 0.7 * t_amp)
+        t_dist = (dist_field / reach).clamp(0.0, 1.0)
+        s = 1.0 - t_dist
+        glow_mask  = s * s * s * (s * (s * 6.0 - 15.0) + 10.0)
+        alpha_glow = glow_mask * frame_alpha
+
+        t_time    = fi / fps
+        max_osc   = H * 0.09 * t_amp
+        x_norm    = torch.linspace(0.0, 1.0, W, dtype=torch.float32, device=dev)
+        y_idx_col = torch.arange(H, dtype=torch.float32, device=dev).unsqueeze(1)
+
+        wave_alpha_gpu = torch.zeros(H, W, dtype=torch.float32, device=dev)
+        base_frac_center = self._line_cfgs[0][0]
+        for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
+            spread_frac = (y_base_frac - base_frac_center) * t_amp
+            effective_frac = base_frac_center + spread_frac
+            wave_y = torch.zeros(W, dtype=torch.float32, device=dev)
+            for i in range(len(self._freqs)):
+                phase_t = float(self._phases[i]) + t_time * float(self._speeds[i]) * 2.0 * math.pi
+                wave_y = wave_y + float(self._wamps[i]) * torch.sin(
+                    float(self._freqs[i]) * x_norm * (2.0 * math.pi) + phase_t + k * 0.9
+                )
+            base_row   = (H - 1) - effective_frac * H
+            anchor_row = (base_row - wave_y * max_osc).clamp(0, H - 1)
+            dist_px    = (y_idx_col - anchor_row.unsqueeze(0)).abs()
+            line_mask  = torch.exp(-0.5 * (dist_px / sigma) ** 2)
+            wave_alpha_gpu = wave_alpha_gpu + line_mask * weight
+
+        wave_alpha_gpu = wave_alpha_gpu.clamp(0.0, 1.0)
+        wave_frame_alpha = 0.2 + 0.2 * t_amp
+        alpha_wave = wave_alpha_gpu * wave_frame_alpha
+
+        alpha_combined = torch.maximum(alpha_glow, alpha_wave).clamp(0.0, 1.0)
+        alpha_u8 = (alpha_combined * 255).to(torch.uint8)
+
+        rgba_gpu = torch.zeros(H, W, 4, dtype=torch.uint8, device=dev)
+        rgba_gpu[:, :, 0] = int(cr)
+        rgba_gpu[:, :, 1] = int(cg)
+        rgba_gpu[:, :, 2] = int(cb)
+        rgba_gpu[:, :, 3] = alpha_u8
+
+        # ✅ Zero-copy: stay contiguous on GPU, single .numpy() call, return bytes
+        return rgba_gpu.contiguous().cpu().numpy().tobytes()
 
     def _render_cpu(self, fi, amplitude, W, H, fps, pcm_window=None):
         """CPU fallback (numpy) — identical logic, no torch dependency."""
