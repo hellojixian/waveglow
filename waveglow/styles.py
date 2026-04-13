@@ -131,8 +131,10 @@ class PlasmaStyle:
                 pts.append((x, y))
 
             # Keep a minimum alpha so lines stay visible during silence
-            min_alpha = int(255 * base_alpha * 0.25)
-            effective_alpha = max(min_alpha, int(255 * base_alpha * min(amplitude * 1.8, 1.0)))
+            # Overall brightness reduced to 45% — subtle, non-distracting
+            brightness = 0.45
+            min_alpha = int(255 * base_alpha * 0.12 * brightness)
+            effective_alpha = max(min_alpha, int(255 * base_alpha * brightness * min(amplitude * 1.8, 1.0)))
 
             for blur_r, a_mult in glow_scales:
                 a = min(int(effective_alpha * a_mult), 255)
