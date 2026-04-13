@@ -66,7 +66,7 @@ def get_rms_per_frame(wav, sr, fps=30):
     """
     Get RMS amplitude per video frame. Returns float[n_frames] in [0, 1].
     """
-    samples_per_frame = sr // fps
+    samples_per_frame = int(sr) // fps
     frames = []
     for i in range(len(wav) // samples_per_frame):
         chunk = wav[i * samples_per_frame:(i + 1) * samples_per_frame]
@@ -83,7 +83,7 @@ def get_fft_per_frame(wav, sr, fps=30, n_bins=80):
     Get FFT magnitude per video frame, log-scaled to n_bins.
     Returns float[n_frames, n_bins] in [0, 1].
     """
-    samples_per_frame = sr // fps
+    samples_per_frame = int(sr) // fps
     fft_size = 2048
     results = []
 
