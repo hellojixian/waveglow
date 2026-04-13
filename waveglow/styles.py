@@ -591,14 +591,13 @@ class GlowBottomWaveStyle:
         self._n_lines = 6
 
         # Line configs: (y_base_frac_from_bottom, sigma_px, weight)
-        # Lowered closer to bottom edge (was 0.06/0.10/0.03/0.13)
         self._line_cfgs = [
-            (0.03, 3.0, 1.00),
-            (0.03, 8.0, 0.40),
-            (0.05, 2.0, 0.65),
-            (0.05, 6.0, 0.25),
-            (0.01, 1.5, 0.50),
-            (0.07, 1.5, 0.30),
+            (0.06, 3.0, 1.00),
+            (0.06, 8.0, 0.40),
+            (0.10, 2.0, 0.65),
+            (0.10, 6.0, 0.25),
+            (0.03, 1.5, 0.50),
+            (0.13, 1.5, 0.30),
         ]
 
     def _get_dist_cache(self, W, H):
@@ -650,32 +649,21 @@ class GlowBottomWaveStyle:
 
         # ---- Layer 2: wave lines (GPU) ----
         t_time    = fi / fps
-        max_osc   = H * 0.08 * (0.4 + 0.6 * t_amp)
+        # Amplitude drives oscillation height (0=flat line, 1=full swing)
+        max_osc   = H * 0.08 * t_amp
         x_norm    = torch.linspace(0.0, 1.0, W, dtype=torch.float32, device=dev)  # (W,)
         y_idx_col = torch.arange(H, dtype=torch.float32, device=dev).unsqueeze(1)  # (H,1)
-
-        # Pre-compute base waveform shape from real PCM audio or sine fallback
-        if pcm_window is not None and len(pcm_window) > 1:
-            pcm_arr = np.asarray(pcm_window, dtype=np.float32)
-            indices = np.linspace(0, len(pcm_arr) - 1, W)
-            resampled = np.interp(indices, np.arange(len(pcm_arr)), pcm_arr)
-            base_wave_shape = torch.tensor(resampled, dtype=torch.float32, device=dev)
-        else:
-            base_wave_shape = None
 
         wave_alpha_gpu = torch.zeros(H, W, dtype=torch.float32, device=dev)
 
         for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
-            # Use real audio waveform if available, else sine fallback
-            if base_wave_shape is not None:
-                roll_offset = int(k * W // (self._n_lines * 2))
-                wave_y = torch.roll(base_wave_shape, roll_offset)
-            else:
-                wave_y = torch.zeros(W, dtype=torch.float32, device=dev)
-                for i in range(len(self._freqs)):
-                    wave_y = wave_y + float(self._wamps[i]) * torch.sin(
-                        float(self._freqs[i]) * x_norm * (2.0 * math.pi) + float(self._phases[i]) + k * 0.9
-                    )
+            # V17 style: scrolling sine (t_time drives phase = horizontal scroll)
+            wave_y = torch.zeros(W, dtype=torch.float32, device=dev)
+            for i in range(len(self._freqs)):
+                phase_t = float(self._phases[i]) + t_time * float(self._speeds[i]) * 2.0 * math.pi
+                wave_y = wave_y + float(self._wamps[i]) * torch.sin(
+                    float(self._freqs[i]) * x_norm * (2.0 * math.pi) + phase_t + k * 0.9
+                )
             # Anchor row: distance from bottom, converted to pixel row
             base_row   = (H - 1) - y_base_frac * H
             anchor_row = (base_row - wave_y * max_osc).clamp(0, H - 1)  # (W,)
@@ -686,31 +674,18 @@ class GlowBottomWaveStyle:
             wave_alpha_gpu = wave_alpha_gpu + line_mask * weight
 
         wave_alpha_gpu = wave_alpha_gpu.clamp(0.0, 1.0)
-        wave_frame_alpha = 0.8 * t_amp
+        # Wave always visible (base 0.4 alpha), amplitude drives extra brightness
+        wave_frame_alpha = 0.4 + 0.4 * t_amp
         alpha_wave = wave_alpha_gpu * wave_frame_alpha
 
-        # ---- Combine: glow=blue, wave=white ----
-        # Glow layer (blue)
-        glow_a = alpha_glow.clamp(0.0, 1.0)
-        # Wave layer (white)
-        wave_a = alpha_wave.clamp(0.0, 1.0)
-
-        # Composite: start transparent, blend glow (blue), then blend wave (white)
-        # R channel: lerp toward blue on glow, white on wave
-        # Simple approach: render two separate color contributions, take max alpha
-        alpha_combined = torch.maximum(glow_a, wave_a).clamp(0.0, 1.0)
-
-        # Per-pixel color: weighted blend of blue (glow) and white (wave)
-        safe_alpha = alpha_combined.clamp(min=1e-6)
-        r_out = ((glow_a * float(cr) + wave_a * 255.0) / (glow_a + wave_a + 1e-6)).clamp(0, 255)
-        g_out = ((glow_a * float(cg) + wave_a * 255.0) / (glow_a + wave_a + 1e-6)).clamp(0, 255)
-        b_out = ((glow_a * float(cb) + wave_a * 255.0) / (glow_a + wave_a + 1e-6)).clamp(0, 255)
-
+        # ---- Combine: single color (glow + wave share same color) ----
+        alpha_combined = torch.maximum(alpha_glow, alpha_wave).clamp(0.0, 1.0)
         alpha_u8 = (alpha_combined * 255).to(torch.uint8)
+
         rgba_gpu = torch.zeros(H, W, 4, dtype=torch.uint8, device=dev)
-        rgba_gpu[:, :, 0] = r_out.to(torch.uint8)
-        rgba_gpu[:, :, 1] = g_out.to(torch.uint8)
-        rgba_gpu[:, :, 2] = b_out.to(torch.uint8)
+        rgba_gpu[:, :, 0] = int(cr)
+        rgba_gpu[:, :, 1] = int(cg)
+        rgba_gpu[:, :, 2] = int(cb)
         rgba_gpu[:, :, 3] = alpha_u8
 
         rgba_np = rgba_gpu.cpu().numpy()
@@ -737,49 +712,30 @@ class GlowBottomWaveStyle:
         alpha_glow = glow_mask * frame_alpha
 
         t_time   = fi / fps
-        max_osc  = H * 0.08 * (0.4 + 0.6 * t_amp)
+        max_osc  = H * 0.08 * t_amp  # amplitude drives oscillation; 0=flat line
         x_norm   = np.linspace(0.0, 1.0, W, dtype=np.float32)
         y_idx    = np.arange(H, dtype=np.float32)[:, np.newaxis]
         wave_alpha = np.zeros((H, W), dtype=np.float32)
 
-        # Base waveform shape from real PCM audio or sine fallback
-        if pcm_window is not None and len(pcm_window) > 1:
-            pcm_arr = np.asarray(pcm_window, dtype=np.float32)
-            indices = np.linspace(0, len(pcm_arr) - 1, W)
-            base_wave_shape = np.interp(indices, np.arange(len(pcm_arr)), pcm_arr)
-        else:
-            base_wave_shape = None
-
         for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
-            if base_wave_shape is not None:
-                roll_offset = int(k * W // (self._n_lines * 2))
-                wave_y = np.roll(base_wave_shape, roll_offset)
-            else:
-                wave_y = np.zeros(W, dtype=np.float32)
-                for i in range(len(self._freqs)):
-                    wave_y += self._wamps[i] * np.sin(
-                        self._freqs[i] * x_norm * 2.0 * math.pi + self._phases[i] + k * 0.9
-                    )
+            wave_y = np.zeros(W, dtype=np.float32)
+            for i in range(len(self._freqs)):
+                phase_t = self._phases[i] + t_time * self._speeds[i] * 2.0 * math.pi
+                wave_y += self._wamps[i] * np.sin(
+                    self._freqs[i] * x_norm * 2.0 * math.pi + phase_t + k * 0.9
+                )
             base_row   = (H - 1) - y_base_frac * H
             anchor_row = np.clip(base_row - wave_y * max_osc, 0, H - 1)
             dist_px    = np.abs(y_idx - anchor_row[np.newaxis, :])
             wave_alpha += np.exp(-0.5 * (dist_px / sigma) ** 2) * weight
 
         wave_alpha = np.clip(wave_alpha, 0.0, 1.0)
-        wave_frame_alpha = 0.8 * t_amp
+        wave_frame_alpha = 0.4 + 0.4 * t_amp  # always visible; louder = brighter
         alpha_wave = wave_alpha * wave_frame_alpha
 
-        # ---- Combine: glow=blue, wave=white ----
-        glow_a = np.clip(alpha_glow, 0.0, 1.0)
-        wave_a = np.clip(alpha_wave, 0.0, 1.0)
-        alpha_combined = np.clip(np.maximum(glow_a, wave_a), 0.0, 1.0)
-
-        denom = glow_a + wave_a + 1e-6
-        r_out = np.clip((glow_a * cr    + wave_a * 255.0) / denom, 0, 255).astype(np.uint8)
-        g_out = np.clip((glow_a * cg    + wave_a * 255.0) / denom, 0, 255).astype(np.uint8)
-        b_out = np.clip((glow_a * cb    + wave_a * 255.0) / denom, 0, 255).astype(np.uint8)
+        alpha_combined = np.clip(np.maximum(alpha_glow, alpha_wave), 0.0, 1.0)
         alpha_arr = (alpha_combined * 255).astype(np.uint8)
 
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
-        rgba[:,:,0] = r_out;  rgba[:,:,1] = g_out;  rgba[:,:,2] = b_out;  rgba[:,:,3] = alpha_arr
+        rgba[:,:,0] = cr;  rgba[:,:,1] = cg;  rgba[:,:,2] = cb;  rgba[:,:,3] = alpha_arr
         return Image.fromarray(rgba, mode="RGBA")
