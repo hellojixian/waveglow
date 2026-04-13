@@ -651,7 +651,7 @@ class GlowBottomWaveStyle:
         # ---- Layer 2: wave lines (GPU) ----
         t_time    = fi / fps
         # Amplitude drives oscillation height (0=flat line, 1=full swing)
-        max_osc   = H * 0.18 * t_amp
+        max_osc   = H * 0.12 * t_amp
         x_norm    = torch.linspace(0.0, 1.0, W, dtype=torch.float32, device=dev)  # (W,)
         y_idx_col = torch.arange(H, dtype=torch.float32, device=dev).unsqueeze(1)  # (H,1)
 
@@ -713,7 +713,7 @@ class GlowBottomWaveStyle:
         alpha_glow = glow_mask * frame_alpha
 
         t_time   = fi / fps
-        max_osc  = H * 0.18 * t_amp  # amplitude drives oscillation; 0=flat line
+        max_osc  = H * 0.12 * t_amp  # amplitude drives oscillation; 0=flat line
         x_norm   = np.linspace(0.0, 1.0, W, dtype=np.float32)
         y_idx    = np.arange(H, dtype=np.float32)[:, np.newaxis]
         wave_alpha = np.zeros((H, W), dtype=np.float32)
