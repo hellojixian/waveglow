@@ -796,13 +796,17 @@ class GlowBottomWaveStyle:
         base_rows      = (H - 1) - spread_fracs * H                                            # (K,)
         anchor_rows    = (base_rows.view(n_lines, 1) - wave_y_lines * max_osc).clamp(0, H-1)  # (K, W)
 
-        # Gaussian distance: (H, K, W) via broadcasting
-        dist_px   = (y_idx_col - anchor_rows.unsqueeze(0)).abs()           # (H, K, W)
-        sigmas    = self._t_sigmas.view(1, n_lines, 1)                     # (1, K, 1)
-        line_mask = torch.exp(-0.5 * (dist_px / sigmas) ** 2)             # (H, K, W)
-        weights   = self._t_weights.view(1, n_lines, 1)                    # (1, K, 1)
-
-        wave_alpha_gpu = (line_mask * weights).sum(dim=1).clamp(0.0, 1.0)  # (H, W)
+        # Gaussian per line — accumulate into (H, W) without materializing (H, K, W)
+        # This avoids a 12.4M-element intermediate tensor (memory BW bottleneck)
+        y_idx_col2 = torch.arange(H, dtype=torch.float32, device=dev).view(H, 1)  # (H, 1)
+        wave_alpha_gpu = torch.zeros(H, W, dtype=torch.float32, device=dev)
+        for k in range(n_lines):
+            sigma  = float(self._t_sigmas[k])
+            weight = float(self._t_weights[k])
+            ar_k   = anchor_rows[k].unsqueeze(0)              # (1, W)
+            dist   = (y_idx_col2 - ar_k).abs()               # (H, W)
+            wave_alpha_gpu = wave_alpha_gpu + torch.exp(-0.5 * (dist / sigma) ** 2) * weight
+        wave_alpha_gpu = wave_alpha_gpu.clamp(0.0, 1.0)
 
         wave_frame_alpha = 0.2 + 0.2 * t_amp
         alpha_wave = wave_alpha_gpu * wave_frame_alpha
