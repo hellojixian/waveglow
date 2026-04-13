@@ -660,9 +660,9 @@ class GlowBottomWaveStyle:
             # Multi-octave sine sum along X
             wave_y = torch.zeros(W, dtype=torch.float32, device=dev)
             for i in range(len(self._freqs)):
-                phase_t = float(self._phases[i]) + t_time * float(self._speeds[i]) * 2.0 * math.pi
+                # Static phase only — no t_time drift, so lines don't scroll horizontally
                 wave_y = wave_y + float(self._wamps[i]) * torch.sin(
-                    float(self._freqs[i]) * x_norm * (2.0 * math.pi) + phase_t + k * 0.9
+                    float(self._freqs[i]) * x_norm * (2.0 * math.pi) + float(self._phases[i]) + k * 0.9
                 )
             # Anchor row: distance from bottom, converted to pixel row
             base_row   = (H - 1) - y_base_frac * H
@@ -721,9 +721,8 @@ class GlowBottomWaveStyle:
         for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
             wave_y = np.zeros(W, dtype=np.float32)
             for i in range(len(self._freqs)):
-                phase_t = self._phases[i] + t_time * self._speeds[i] * 2.0 * math.pi
                 wave_y += self._wamps[i] * np.sin(
-                    self._freqs[i] * x_norm * 2.0 * math.pi + phase_t + k * 0.9
+                    self._freqs[i] * x_norm * 2.0 * math.pi + self._phases[i] + k * 0.9
                 )
             base_row   = (H - 1) - y_base_frac * H
             anchor_row = np.clip(base_row - wave_y * max_osc, 0, H - 1)
