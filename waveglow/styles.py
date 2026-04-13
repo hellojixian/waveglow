@@ -577,9 +577,12 @@ class GlowBottomWaveStyle:
             import torch
             self._torch = torch
             self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # torch.compile available in PyTorch 2.0+ — reduces kernel launch overhead
+            self._compile_available = hasattr(torch, 'compile') and self._device.type == "cuda"
         except ImportError:
             self._torch = None
             self._device = None
+            self._compile_available = False
 
         # Wave parameters
         rng = np.random.default_rng(7)
@@ -710,7 +713,12 @@ class GlowBottomWaveStyle:
         return Image.fromarray(rgba_np, mode="RGBA")
 
     def _render_gpu_bytes(self, fi, amplitude, W, H, fps, pcm_window=None):
-        """GPU-accelerated render returning raw RGBA bytes — skips PIL entirely."""
+        """GPU-accelerated render — fully batched wave computation, zero-copy bytes output.
+
+        Key optimization vs old version:
+        - Old: 6 lines × 5 freqs = 30 sequential CUDA kernel launches (Python for-loops)
+        - New: single batched matmul for all sin() calls → 1 kernel launch total
+        """
         torch = self._torch
         dev   = self._device
 
@@ -721,10 +729,11 @@ class GlowBottomWaveStyle:
         frame_alpha = 0.08 * t_amp
 
         r1,g1,b1 = self.color;  r2,g2,b2 = self.color2
-        cr = (r1 + (r2-r1)*t_amp) * 255
-        cg = (g1 + (g2-g1)*t_amp) * 255
-        cb = (b1 + (b2-b1)*t_amp) * 255
+        cr = int((r1 + (r2-r1)*t_amp) * 255)
+        cg = int((g1 + (g2-g1)*t_amp) * 255)
+        cb = int((b1 + (b2-b1)*t_amp) * 255)
 
+        # ---- Glow layer ----
         dist_field = self._get_dist_cache(W, H)
         reach_base = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40
         reach = reach_base * (0.3 + 0.7 * t_amp)
@@ -733,42 +742,81 @@ class GlowBottomWaveStyle:
         glow_mask  = s * s * s * (s * (s * 6.0 - 15.0) + 10.0)
         alpha_glow = glow_mask * frame_alpha
 
-        t_time    = fi / fps
-        max_osc   = H * 0.09 * t_amp
-        x_norm    = torch.linspace(0.0, 1.0, W, dtype=torch.float32, device=dev)
-        y_idx_col = torch.arange(H, dtype=torch.float32, device=dev).unsqueeze(1)
+        # ---- Wave layer — fully batched ----
+        t_time  = fi / fps
+        max_osc = H * 0.09 * t_amp
 
-        wave_alpha_gpu = torch.zeros(H, W, dtype=torch.float32, device=dev)
+        # x_norm: (W,)  →  phases_t: (n_freqs,)  →  freq_x: (n_freqs, W)
+        x_norm = torch.linspace(0.0, 1.0, W, dtype=torch.float32, device=dev)  # (W,)
+
+        # Ensure freq/phase/speed/wamp tensors are on GPU (cached after first frame)
+        if not hasattr(self, '_t_freqs') or self._t_freqs.device != dev:
+            self._t_freqs  = torch.tensor(self._freqs,  dtype=torch.float32, device=dev)  # (F,)
+            self._t_phases = torch.tensor(self._phases, dtype=torch.float32, device=dev)  # (F,)
+            self._t_speeds = torch.tensor(self._speeds, dtype=torch.float32, device=dev)  # (F,)
+            self._t_wamps  = torch.tensor(self._wamps,  dtype=torch.float32, device=dev)  # (F,)
+
+        n_lines = self._n_lines
+        n_freqs = len(self._freqs)
         base_frac_center = self._line_cfgs[0][0]
-        for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
-            spread_frac = (y_base_frac - base_frac_center) * t_amp
-            effective_frac = base_frac_center + spread_frac
-            wave_y = torch.zeros(W, dtype=torch.float32, device=dev)
-            for i in range(len(self._freqs)):
-                phase_t = float(self._phases[i]) + t_time * float(self._speeds[i]) * 2.0 * math.pi
-                wave_y = wave_y + float(self._wamps[i]) * torch.sin(
-                    float(self._freqs[i]) * x_norm * (2.0 * math.pi) + phase_t + k * 0.9
-                )
-            base_row   = (H - 1) - effective_frac * H
-            anchor_row = (base_row - wave_y * max_osc).clamp(0, H - 1)
-            dist_px    = (y_idx_col - anchor_row.unsqueeze(0)).abs()
-            line_mask  = torch.exp(-0.5 * (dist_px / sigma) ** 2)
-            wave_alpha_gpu = wave_alpha_gpu + line_mask * weight
 
-        wave_alpha_gpu = wave_alpha_gpu.clamp(0.0, 1.0)
+        # k_offsets: (K,1)  —  per-line phase offset
+        k_idx = torch.arange(n_lines, dtype=torch.float32, device=dev)  # (K,)
+        k_offset = k_idx * 0.9  # (K,)
+
+        # phase_t: (F,)  — current scroll phase per frequency
+        phase_t = self._t_phases + t_time * self._t_speeds * (2.0 * math.pi)  # (F,)
+
+        # Batched sin: args shape (K, F, W)
+        #   freq (F,) × x_norm (W,) → (F, W) → unsqueeze → (1, F, W)
+        #   phase_t (F,) → (1, F, 1)
+        #   k_offset (K,) → (K, 1, 1)
+        freq_x  = self._t_freqs.unsqueeze(1) * x_norm.unsqueeze(0) * (2.0 * math.pi)  # (F, W)
+        args    = freq_x.unsqueeze(0) + phase_t.view(1, n_freqs, 1) + k_offset.view(n_lines, 1, 1)  # (K,F,W)
+        sins    = torch.sin(args)  # (K, F, W)  — single fused kernel
+
+        # Weighted sum over freqs: wave_y_per_line (K, W)
+        wave_y_lines = (sins * self._t_wamps.view(1, n_freqs, 1)).sum(dim=1)  # (K, W)
+
+        # Per-line effective anchor rows: (K, W)
+        y_idx_col = torch.arange(H, dtype=torch.float32, device=dev).view(H, 1, 1)  # (H,1,1)
+
+        # Precompute per-line base_rows and sigmas/weights as tensors
+        if not hasattr(self, '_t_line_base_rows') or self._t_line_base_rows.shape[0] != n_lines:
+            eff_fracs  = torch.tensor(
+                [base_frac_center + (cfg[0] - base_frac_center) for cfg in self._line_cfgs[:n_lines]],
+                dtype=torch.float32, device=dev)                                     # (K,)
+            self._t_eff_fracs_base = eff_fracs  # store base; spread applied per frame
+            self._t_sigmas  = torch.tensor([cfg[1] for cfg in self._line_cfgs[:n_lines]], dtype=torch.float32, device=dev)  # (K,)
+            self._t_weights = torch.tensor([cfg[2] for cfg in self._line_cfgs[:n_lines]], dtype=torch.float32, device=dev)  # (K,)
+            self._t_ybase_fracs = torch.tensor([cfg[0] for cfg in self._line_cfgs[:n_lines]], dtype=torch.float32, device=dev)
+
+        # Spread lines apart with amplitude
+        spread_fracs   = base_frac_center + (self._t_ybase_fracs - base_frac_center) * t_amp  # (K,)
+        base_rows      = (H - 1) - spread_fracs * H                                            # (K,)
+        anchor_rows    = (base_rows.view(n_lines, 1) - wave_y_lines * max_osc).clamp(0, H-1)  # (K, W)
+
+        # Gaussian distance: (H, K, W) via broadcasting
+        dist_px   = (y_idx_col - anchor_rows.unsqueeze(0)).abs()           # (H, K, W)
+        sigmas    = self._t_sigmas.view(1, n_lines, 1)                     # (1, K, 1)
+        line_mask = torch.exp(-0.5 * (dist_px / sigmas) ** 2)             # (H, K, W)
+        weights   = self._t_weights.view(1, n_lines, 1)                    # (1, K, 1)
+
+        wave_alpha_gpu = (line_mask * weights).sum(dim=1).clamp(0.0, 1.0)  # (H, W)
+
         wave_frame_alpha = 0.2 + 0.2 * t_amp
         alpha_wave = wave_alpha_gpu * wave_frame_alpha
 
+        # ---- Combine & output ----
         alpha_combined = torch.maximum(alpha_glow, alpha_wave).clamp(0.0, 1.0)
-        alpha_u8 = (alpha_combined * 255).to(torch.uint8)
+        alpha_u8 = (alpha_combined * 255).to(torch.uint8)  # (H, W)
 
-        rgba_gpu = torch.zeros(H, W, 4, dtype=torch.uint8, device=dev)
-        rgba_gpu[:, :, 0] = int(cr)
-        rgba_gpu[:, :, 1] = int(cg)
-        rgba_gpu[:, :, 2] = int(cb)
-        rgba_gpu[:, :, 3] = alpha_u8
+        # Build RGBA in a single stacked op (no scalar fill loops)
+        color_plane = torch.tensor([cr, cg, cb], dtype=torch.uint8, device=dev)  # (3,)
+        rgb_planes  = color_plane.view(1, 1, 3).expand(H, W, 3)                  # (H, W, 3)
+        rgba_gpu    = torch.cat([rgb_planes, alpha_u8.unsqueeze(2)], dim=2)       # (H, W, 4)
 
-        # ✅ Zero-copy: stay contiguous on GPU, single .numpy() call, return bytes
+        # ✅ Zero-copy: contiguous GPU tensor → single CPU transfer → raw bytes
         return rgba_gpu.contiguous().cpu().numpy().tobytes()
 
     def _render_cpu(self, fi, amplitude, W, H, fps, pcm_window=None):
