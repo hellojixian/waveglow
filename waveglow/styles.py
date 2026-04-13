@@ -554,131 +554,184 @@ class GlowTopBottomStyle(GlowEdgeStyle):
 
 class GlowBottomWaveStyle:
     """
-    Bottom-edge glow + plasma waveform overlay.
+    Bottom-edge glow + plasma waveform overlay — GPU-accelerated via PyTorch CUDA.
+    Falls back to CPU (numpy) if CUDA is unavailable.
     - Soft breathing gradient from the bottom edge upward (smootherstep, 40% height)
-    - Multi-line plasma wave centered ON the bottom edge (wave floats upward)
+    - Multi-line plasma wave oscillating near the bottom edge
     - Brightness: 0%–15%
     """
 
     def __init__(self, color=None, color2=None, glow=6, fps=30, **kwargs):
-        self.color  = color  or (0.10, 0.23, 0.42)   # deep blue
-        self.color2 = color2 or (0.30, 0.62, 1.00)   # bright blue
+        self.color  = color  or (0.10, 0.23, 0.42)
+        self.color2 = color2 or (0.30, 0.62, 1.00)
         self.glow_intensity = max(1, min(10, glow))
         self.fps = fps
         tau = 0.4
         self._ema_alpha = 1.0 - math.exp(-1.0 / (fps * tau))
         self._smoothed_amp = 0.0
         self._cache_shape = None
-        self._dist_cache = None
-        # Wave parameters (5 octaves, same seed as PlasmaStyle for consistency)
+        self._dist_cache = None   # GPU tensor when CUDA available
+
+        # Detect GPU
+        try:
+            import torch
+            self._torch = torch
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        except ImportError:
+            self._torch = None
+            self._device = None
+
+        # Wave parameters
         rng = np.random.default_rng(7)
         self._freqs  = rng.uniform(0.5, 2.5, size=5).astype(np.float32)
         self._phases = rng.uniform(0, 2 * math.pi, size=5).astype(np.float32)
         self._wamps  = rng.uniform(0.3, 1.0, size=5).astype(np.float32)
         self._wamps /= self._wamps.sum()
         self._speeds = rng.uniform(0.3, 1.0, size=5).astype(np.float32)
-        # Number of wave lines to draw
         self._n_lines = 6
 
-    @staticmethod
-    def _smootherstep(x):
-        x = np.clip(x, 0.0, 1.0)
-        return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+        # Line configs: (y_base_frac_from_bottom, sigma_px, weight)
+        self._line_cfgs = [
+            (0.06, 3.0, 1.00),
+            (0.06, 8.0, 0.40),
+            (0.10, 2.0, 0.65),
+            (0.10, 6.0, 0.25),
+            (0.03, 1.5, 0.50),
+            (0.13, 1.5, 0.30),
+        ]
 
-    def _bottom_dist_field(self, W, H):
-        """Normalised distance from BOTTOM edge only: 0=bottom, 1=top."""
+    def _get_dist_cache(self, W, H):
+        """Bottom-edge distance field, cached on GPU (or CPU)."""
         if self._cache_shape != (W, H):
-            y_idx = np.arange(H, dtype=np.float32)
-            dist_bottom = (H - 1 - y_idx) / float(H - 1)  # 0=bottom row, 1=top row
-            self._dist_cache = np.broadcast_to(dist_bottom[:, np.newaxis], (H, W)).copy()
+            if self._torch is not None:
+                torch = self._torch
+                y_idx = torch.arange(H, dtype=torch.float32, device=self._device)
+                dist_bottom = (H - 1 - y_idx) / float(H - 1)   # 0=bottom, 1=top
+                self._dist_cache = dist_bottom.unsqueeze(1).expand(H, W).contiguous()
+            else:
+                y_idx = np.arange(H, dtype=np.float32)
+                dist_bottom = (H - 1 - y_idx) / float(H - 1)
+                self._dist_cache = np.broadcast_to(dist_bottom[:, np.newaxis], (H, W)).copy()
             self._cache_shape = (W, H)
         return self._dist_cache
 
     def render_frame(self, fi, amplitude, W, H, fps=30):
-        # --- Smooth amplitude ---
+        if self._torch is not None and self._device.type == "cuda":
+            return self._render_gpu(fi, amplitude, W, H, fps)
+        return self._render_cpu(fi, amplitude, W, H, fps)
+
+    def _render_gpu(self, fi, amplitude, W, H, fps):
+        torch = self._torch
+        dev   = self._device
+
+        # EMA smooth
         self._smoothed_amp += self._ema_alpha * (amplitude - self._smoothed_amp)
-        amp = self._smoothed_amp
+        amp   = self._smoothed_amp
         t_amp = min(amp * 2.0, 1.0)
 
-        # --- Brightness 0%–15% ---
-        base_alpha = 0.00
-        peak_alpha = 0.15
-        frame_alpha = base_alpha + (peak_alpha - base_alpha) * t_amp
+        frame_alpha = 0.15 * t_amp   # 0–15%
 
-        # --- Color lerp deep→bright blue ---
-        r1, g1, b1 = self.color
-        r2, g2, b2 = self.color2
-        cr = int((r1 + (r2 - r1) * t_amp) * 255)
-        cg = int((g1 + (g2 - g1) * t_amp) * 255)
-        cb = int((b1 + (b2 - b1) * t_amp) * 255)
+        # Color lerp
+        r1,g1,b1 = self.color;  r2,g2,b2 = self.color2
+        cr = (r1 + (r2-r1)*t_amp) * 255
+        cg = (g1 + (g2-g1)*t_amp) * 255
+        cb = (b1 + (b2-b1)*t_amp) * 255
 
-        # ============================================================
-        # Layer 1: bottom gradient glow (40% height)
-        # ============================================================
-        dist_field = self._bottom_dist_field(W, H)   # 0=bottom, 1=top
-        reach = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40  # 40% of original
+        # ---- Layer 1: bottom glow gradient (GPU) ----
+        dist_field = self._get_dist_cache(W, H)   # (H, W) GPU tensor, 0=bottom
+        reach = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40
+        t_dist = (dist_field / reach).clamp(0.0, 1.0)
+        # smootherstep of (1 - t_dist)
+        s = 1.0 - t_dist
+        glow_mask  = s * s * s * (s * (s * 6.0 - 15.0) + 10.0)   # (H, W)
+        alpha_glow = glow_mask * frame_alpha
+
+        # ---- Layer 2: wave lines (GPU) ----
+        t_time    = fi / fps
+        max_osc   = H * 0.08 * (0.4 + 0.6 * t_amp)
+        x_norm    = torch.linspace(0.0, 1.0, W, dtype=torch.float32, device=dev)  # (W,)
+        y_idx_col = torch.arange(H, dtype=torch.float32, device=dev).unsqueeze(1)  # (H,1)
+
+        # Pre-compute per-octave phases (scalars, on CPU is fine)
+        wave_alpha_gpu = torch.zeros(H, W, dtype=torch.float32, device=dev)
+
+        for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
+            # Multi-octave sine sum along X
+            wave_y = torch.zeros(W, dtype=torch.float32, device=dev)
+            for i in range(len(self._freqs)):
+                phase_t = float(self._phases[i]) + t_time * float(self._speeds[i]) * 2.0 * math.pi
+                wave_y = wave_y + float(self._wamps[i]) * torch.sin(
+                    float(self._freqs[i]) * x_norm * (2.0 * math.pi) + phase_t + k * 0.9
+                )
+            # Anchor row: distance from bottom, converted to pixel row
+            base_row   = (H - 1) - y_base_frac * H
+            anchor_row = (base_row - wave_y * max_osc).clamp(0, H - 1)  # (W,)
+
+            # Gaussian blob: (H,1) vs (1,W) broadcast
+            dist_px   = (y_idx_col - anchor_row.unsqueeze(0)).abs()  # (H, W)
+            line_mask = torch.exp(-0.5 * (dist_px / sigma) ** 2)
+            wave_alpha_gpu = wave_alpha_gpu + line_mask * weight
+
+        wave_alpha_gpu = wave_alpha_gpu.clamp(0.0, 1.0)
+        alpha_wave = wave_alpha_gpu * frame_alpha * 0.8
+
+        # ---- Combine ----
+        alpha_combined = torch.maximum(alpha_glow, alpha_wave).clamp(0.0, 1.0)
+        alpha_u8 = (alpha_combined * 255).to(torch.uint8)
+
+        # Build RGBA tensor on GPU, then transfer to CPU once
+        rgba_gpu = torch.zeros(H, W, 4, dtype=torch.uint8, device=dev)
+        rgba_gpu[:, :, 0] = int(cr)
+        rgba_gpu[:, :, 1] = int(cg)
+        rgba_gpu[:, :, 2] = int(cb)
+        rgba_gpu[:, :, 3] = alpha_u8
+
+        rgba_np = rgba_gpu.cpu().numpy()
+        return Image.fromarray(rgba_np, mode="RGBA")
+
+    def _render_cpu(self, fi, amplitude, W, H, fps):
+        """CPU fallback (numpy) — identical logic, no torch dependency."""
+        self._smoothed_amp += self._ema_alpha * (amplitude - self._smoothed_amp)
+        amp   = self._smoothed_amp
+        t_amp = min(amp * 2.0, 1.0)
+        frame_alpha = 0.15 * t_amp
+
+        r1,g1,b1 = self.color;  r2,g2,b2 = self.color2
+        cr = int((r1 + (r2-r1)*t_amp) * 255)
+        cg = int((g1 + (g2-g1)*t_amp) * 255)
+        cb = int((b1 + (b2-b1)*t_amp) * 255)
+
+        dist_field = self._get_dist_cache(W, H)
+        reach = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40
         t_dist = np.clip(dist_field / reach, 0.0, 1.0)
-        glow_mask = self._smootherstep(1.0 - t_dist)    # 1 at bottom, 0 at reach height
-        alpha_glow = glow_mask * frame_alpha             # (H, W) in [0, 1]
+        s = 1.0 - t_dist
+        glow_mask  = s*s*s*(s*(s*6.0-15.0)+10.0)
+        alpha_glow = glow_mask * frame_alpha
 
-        # ============================================================
-        # Layer 2: plasma wave lines centered on bottom edge
-        # ============================================================
-        t_time = fi / fps
-        x_norm = np.linspace(0.0, 1.0, W, dtype=np.float32)  # (W,)
+        t_time   = fi / fps
+        max_osc  = H * 0.08 * (0.4 + 0.6 * t_amp)
+        x_norm   = np.linspace(0.0, 1.0, W, dtype=np.float32)
+        y_idx    = np.arange(H, dtype=np.float32)[:, np.newaxis]
+        wave_alpha = np.zeros((H, W), dtype=np.float32)
 
-        # Max wave oscillation: 8% of frame height, modulated by amplitude
-        max_osc_px = H * 0.08 * (0.4 + 0.6 * t_amp)
-
-        # Build alpha accumulator for wave lines
-        wave_alpha = np.zeros((H, W), dtype=np.float32)  # (H, W)
-
-        # Wave line configs: (y_base_frac_from_bottom, sigma_px, weight)
-        # y_base_frac: 0.0 = bottom edge, positive = upward into frame
-        line_cfgs = [
-            (0.06, 3.0, 1.00),   # main line, 6% up from bottom
-            (0.06, 8.0, 0.40),   # glow halo around main line
-            (0.10, 2.0, 0.65),   # secondary line slightly higher
-            (0.10, 6.0, 0.25),   # halo for secondary
-            (0.03, 1.5, 0.50),   # thin accent near bottom
-            (0.13, 1.5, 0.30),   # thin accent further up
-        ]
-
-        for k, (y_base_frac, sigma, weight) in enumerate(line_cfgs[:self._n_lines]):
-            # Compute wave oscillation for this line
+        for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
             wave_y = np.zeros(W, dtype=np.float32)
             for i in range(len(self._freqs)):
                 phase_t = self._phases[i] + t_time * self._speeds[i] * 2.0 * math.pi
                 wave_y += self._wamps[i] * np.sin(
                     self._freqs[i] * x_norm * 2.0 * math.pi + phase_t + k * 0.9
                 )
-            # wave_y in [-1, 1]; scale to oscillation pixels
-            # Base center: y_base_frac * H up from bottom edge
-            #   In pixel coords: row = H-1 - y_base_frac * H  (lower row = bottom)
-            base_row = (H - 1) - y_base_frac * H
-            # Oscillation: positive wave_y moves line further up (row decreases)
-            anchor_row = base_row - wave_y * max_osc_px  # (W,) float row positions
-            anchor_row = np.clip(anchor_row, 0, H - 1)
-
-            # Gaussian blob around anchor_row per column
-            y_idx = np.arange(H, dtype=np.float32)[:, np.newaxis]  # (H, 1)
-            dist_px = np.abs(y_idx - anchor_row[np.newaxis, :])     # (H, W)
-            line_mask = np.exp(-0.5 * (dist_px / sigma) ** 2)
-            wave_alpha += line_mask * weight
+            base_row   = (H - 1) - y_base_frac * H
+            anchor_row = np.clip(base_row - wave_y * max_osc, 0, H - 1)
+            dist_px    = np.abs(y_idx - anchor_row[np.newaxis, :])
+            wave_alpha += np.exp(-0.5 * (dist_px / sigma) ** 2) * weight
 
         wave_alpha = np.clip(wave_alpha, 0.0, 1.0)
-        # Wave brightness: same frame_alpha envelope
-        alpha_wave = wave_alpha * frame_alpha * 0.8   # slightly dimmer than glow
+        alpha_wave = wave_alpha * frame_alpha * 0.8
 
-        # ============================================================
-        # Combine: max-blend glow + wave layers
-        # ============================================================
         alpha_combined = np.clip(np.maximum(alpha_glow, alpha_wave), 0.0, 1.0)
         alpha_arr = (alpha_combined * 255).astype(np.uint8)
 
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
-        rgba[:, :, 0] = cr
-        rgba[:, :, 1] = cg
-        rgba[:, :, 2] = cb
-        rgba[:, :, 3] = alpha_arr
+        rgba[:,:,0] = cr;  rgba[:,:,1] = cg;  rgba[:,:,2] = cb;  rgba[:,:,3] = alpha_arr
         return Image.fromarray(rgba, mode="RGBA")

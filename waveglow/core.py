@@ -204,25 +204,54 @@ class WaveGlow:
         elif y_position is None:
             y_position = vid_h - height
 
+        # Detect GPU encoder availability
+        use_nvenc = self._nvenc_available()
+        enc_args = (
+            ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "18", "-pix_fmt", "yuv420p"]
+            if use_nvenc else
+            ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]
+        )
+        if use_nvenc:
+            print("GPU encoding: h264_nvenc (RTX)")
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            frames_dir = tmp / "frames"
-            frames_dir.mkdir()
+            local_out = tmp / "output.mp4"
 
-            print(f"Rendering {n_frames} frames...")
+            print(f"Rendering {n_frames} frames (pipe to ffmpeg)...")
+
+            # ffmpeg overlay pipeline: reads video + raw RGBA pipe, composites, encodes
+            ff_cmd = [
+                "ffmpeg", "-y", "-loglevel", "warning",
+                "-i", str(video_path.resolve()),
+                # raw RGBA frames pipe
+                "-f", "rawvideo", "-vcodec", "rawvideo",
+                "-s", f"{width}x{height}",
+                "-pix_fmt", "rgba",
+                "-r", str(self.fps),
+                "-i", "pipe:0",
+                # audio
+                "-i", str(audio_path.resolve()),
+                "-filter_complex",
+                f"[1:v]format=rgba[wv];[0:v][wv]overlay=0:{y_position}:format=auto[outv]",
+                "-map", "[outv]", "-map", "2:a",
+            ] + enc_args + [
+                "-c:a", "aac", "-ar", "44100",
+                str(local_out),
+            ]
+
+            ff_proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE)
+
             for fi in tqdm(range(n_frames), unit=" frames", ncols=80):
                 amp = float(rms[fi]) if fi < len(rms) else 0.0
                 amp = min(amp * 2.0, 1.0)
 
-                if self.style_name == "plasma":
-                    frame = self.renderer.render_frame(fi, amp, width, height, self.fps)
-                elif self.style_name == "bars":
+                if self.style_name == "bars":
                     fft_frame = fft[fi] if fi < len(fft) else np.zeros(80)
                     frame = self.renderer.render_frame(fi, fft_frame, width, height, self.fps)
                 elif self.style_name == "envelope":
                     frame = self.renderer.render_frame(fi, env, width, height, self.fps)
                 else:
-                    # plasma, glow-edge, and any future styles that take (fi, amp, W, H, fps)
                     frame = self.renderer.render_frame(fi, amp, width, height, self.fps)
 
                 if self.opacity < 1.0:
@@ -230,27 +259,28 @@ class WaveGlow:
                     a = a.point(lambda x: int(x * self.opacity))
                     frame = Image.merge("RGBA", (r, g, b, a))
 
-                frame.save(frames_dir / f"{fi:06d}.png")
+                # Pipe raw RGBA bytes directly to ffmpeg (no disk I/O)
+                ff_proc.stdin.write(frame.tobytes())
+
+            ff_proc.stdin.close()
+            ff_proc.wait()
+            if ff_proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed with code {ff_proc.returncode}")
 
             print("Compositing...")
-            # Write to local tmp first (avoid NFS moov truncation)
-            local_out = tmp / "output.mp4"
-            subprocess.run([
-                "ffmpeg", "-y", "-loglevel", "warning",
-                "-i", str(video_path.resolve()),
-                "-framerate", str(self.fps),
-                "-i", str(frames_dir / "%06d.png"),
-                "-i", str(audio_path.resolve()),
-                "-filter_complex",
-                f"[1:v]format=rgba[wv];[0:v][wv]overlay=0:{y_position}:format=auto[outv]",
-                "-map", "[outv]", "-map", "2:a",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-ar", "44100",
-                str(local_out),
-            ], check=True)
-
             import shutil
             shutil.copy2(local_out, output_path)
 
         print(f"✓ Output: {output_path}")
+
+    @staticmethod
+    def _nvenc_available():
+        """Check if h264_nvenc encoder is available in this ffmpeg build."""
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=5
+            )
+            return "h264_nvenc" in result.stdout
+        except Exception:
+            return False
