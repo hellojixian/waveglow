@@ -629,7 +629,7 @@ class GlowBottomWaveStyle:
         amp   = self._smoothed_amp
         t_amp = min(amp * 2.0, 1.0)
 
-        frame_alpha = 0.04 * t_amp   # 0–4% (glow only)
+        frame_alpha = 0.08 * t_amp   # 0–8% (half of original 15%)
 
         # Color lerp
         r1,g1,b1 = self.color;  r2,g2,b2 = self.color2
