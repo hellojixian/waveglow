@@ -82,37 +82,96 @@ class WaveGlow:
 
     def render(self, audio_path, output_path, width=1920, height=200, bg=None, seek=None, duration=None):
         """
-        Generate waveform video (transparent bg by default).
+        Generate waveform video.
+
+        GPU fast-path activates for glow styles with solid bg:
+        pipes raw RGBA bytes to ffmpeg (h264_nvenc), skipping PNG I/O entirely.
 
         Args:
             audio_path: path to audio file
             output_path: path for output .mp4
-            width, height: dimensions of waveform area
-            bg: background color (r,g,b) or None for transparent
+            width, height: video dimensions
+            bg: background color (r,g,b) in [0,1] or None for transparent
             seek: start time in seconds
             duration: duration in seconds
         """
+        import shutil
         audio_path = Path(audio_path)
         output_path = Path(output_path)
 
         wav, sr = read_audio(audio_path, seek=seek, duration=duration)
         n_frames = int(len(wav) / sr * self.fps)
 
-        # Pre-compute audio data
         rms = get_rms_per_frame(wav, sr, fps=self.fps)
         fft = get_fft_per_frame(wav, sr, fps=self.fps)
 
         if self.style_name == "envelope":
             env = get_envelope(wav, sr)
-            env = np.pad(env, (0, n_frames * 3))  # pad for safety
+            env = np.pad(env, (0, n_frames * 3))
 
+        # GPU fast-path: solid bg + glow style + render_frame_bytes available
+        use_gpu_pipe = (
+            bg is not None
+            and self.opacity >= 1.0
+            and self.style_name in ("glow-bottom-wave", "glow-wave", "glow-edge", "glow-top-bottom")
+            and hasattr(self.renderer, "render_frame_bytes")
+        )
+
+        if use_gpu_pipe:
+            bg_r = int(bg[0] * 255); bg_g = int(bg[1] * 255); bg_b = int(bg[2] * 255)
+            use_nvenc = self._nvenc_available()
+            encoder_args = (
+                ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "18"]
+                if use_nvenc else
+                ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]
+            )
+            audio_args = []
+            if seek is not None:
+                audio_args += ["-ss", str(seek)]
+            audio_args += ["-i", str(audio_path.resolve())]
+            if duration is not None:
+                audio_args += ["-t", str(duration)]
+
+            tmp_out = Path("/tmp") / (output_path.stem + "_render_tmp.mp4")
+            ff_cmd = [
+                "ffmpeg", "-y", "-loglevel", "warning",
+                "-f", "rawvideo", "-vcodec", "rawvideo",
+                "-s", f"{width}x{height}",
+                "-pix_fmt", "rgba",
+                "-r", str(self.fps),
+                "-i", "pipe:0",
+            ] + audio_args + encoder_args + [
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ar", "44100",
+                "-shortest",
+                str(tmp_out),
+            ]
+
+            print(f"[WaveGlow] GPU pipe render: {n_frames} frames ({'h264_nvenc' if use_nvenc else 'libx264'})...")
+            ff_proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE)
+
+            for fi in tqdm(range(n_frames), unit=" frames", ncols=80):
+                amp = min(float(rms[fi]) * 2.0, 1.0) if fi < len(rms) else 0.0
+                # Direct pipe raw RGBA bytes - ffmpeg composites onto bg_color via yuv420p conversion
+                raw = self.renderer.render_frame_bytes(fi, amp, width, height, self.fps)
+                ff_proc.stdin.write(raw)
+
+            ff_proc.stdin.close()
+            ff_proc.wait()
+            if ff_proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed with code {ff_proc.returncode}")
+            shutil.move(str(tmp_out), str(output_path))
+            print(f"\u2713 Rendered: {output_path}")
+            return
+
+        # Fallback: PNG sequence (transparency / non-GPU styles)
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             print(f"Rendering {n_frames} frames ({self.style_name} style)...")
 
             for fi in tqdm(range(n_frames), unit=" frames", ncols=80):
                 amp = float(rms[fi]) if fi < len(rms) else 0.0
-                amp = min(amp * 2.0, 1.0)  # boost reactivity
+                amp = min(amp * 2.0, 1.0)
 
                 if self.style_name == "plasma":
                     frame = self.renderer.render_frame(fi, amp, width, height, self.fps)
@@ -124,13 +183,11 @@ class WaveGlow:
                 else:
                     frame = self.renderer.render_frame(fi, amp, width, height, self.fps)
 
-                # Apply opacity
                 if self.opacity < 1.0:
                     r, g, b, a = frame.split()
                     a = a.point(lambda x: int(x * self.opacity))
                     frame = Image.merge("RGBA", (r, g, b, a))
 
-                # Apply background
                 if bg is not None:
                     bg_img = Image.new("RGBA", (width, height),
                                       (int(bg[0]*255), int(bg[1]*255), int(bg[2]*255), 255))
@@ -158,7 +215,7 @@ class WaveGlow:
                 str(output_path.resolve()),
             ], check=True, cwd=tmp)
 
-        print(f"✓ Rendered: {output_path}")
+        print(f"\u2713 Rendered: {output_path}")
 
     def overlay(self, audio_path, video_path, output_path, y_position=None,
                 width=1920, height=200, seek=None, duration=None):
