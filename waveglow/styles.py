@@ -281,68 +281,77 @@ class EnvelopeStyle:
 
 class GlowEdgeStyle:
     """
-    Breathing edge-glow effect: radial vignette from all four sides inward.
-    Color and intensity pulse with audio amplitude. Zero amplitude = faint base glow.
+    Breathing side-glow effect: left and right edges only, inward gradient.
+    - Max brightness capped at 15%
+    - Amplitude smoothed with EMA (~0.5s lag) for gentle breathing, not instant jumps
     """
 
-    def __init__(self, color=None, color2=None, glow=6, **kwargs):
+    def __init__(self, color=None, color2=None, glow=6, fps=30, **kwargs):
         # Primary glow color (default: deep blue #1A3A6A)
         self.color = color or (0.10, 0.23, 0.42)
         # Accent color for peak brightness (default: bright blue #4D9EFF)
         self.color2 = color2 or (0.30, 0.62, 1.00)
-        self.glow_intensity = glow  # 1-10
+        self.glow_intensity = max(1, min(10, glow))
+        # EMA smoothing: alpha = 1 - e^(-1/(fps*tau)) where tau is time constant in seconds
+        # tau=0.5s at 30fps → smooth transitions ~15 frames
+        tau = 0.5  # seconds
+        self._ema_alpha = 1.0 - math.exp(-1.0 / (fps * tau))
+        self._smoothed_amp = 0.0
+        # Pre-compute static gradient mask (only depends on W, H)
+        self._cache_shape = None
+        self._dist_x_cache = None
+
+    def _get_dist_x(self, W, H):
+        """Left-right only distance field, cached per resolution."""
+        if self._cache_shape != (W, H):
+            x_idx = np.arange(W, dtype=np.float32)
+            # Normalized distance from left/right edge: 0=edge, 1=center
+            dist_left  = x_idx / (W * 0.5)
+            dist_right = (W - 1 - x_idx) / (W * 0.5)
+            dist_x = np.minimum(dist_left, dist_right)  # (W,)
+            # Broadcast to (H, W)
+            self._dist_x_cache = np.broadcast_to(dist_x[np.newaxis, :], (H, W)).copy()
+            self._cache_shape = (W, H)
+        return self._dist_x_cache
 
     def render_frame(self, fi, amplitude, W, H, fps=30):
         """
-        Render a full-frame RGBA edge glow.
-        amplitude: 0.0–1.0 (audio RMS)
+        Render a full-frame RGBA side glow (left + right only).
+        amplitude: 0.0–1.0 (audio RMS, raw)
         """
-        # Breathing: base glow always present, peaks on loud audio
-        base_alpha = 0.08 + 0.12 * self.glow_intensity / 10.0   # 0.08–0.20
-        peak_alpha = 0.25 + 0.50 * self.glow_intensity / 10.0   # 0.25–0.75
+        # --- Smooth amplitude with EMA ---
+        self._smoothed_amp += self._ema_alpha * (amplitude - self._smoothed_amp)
+        amp = self._smoothed_amp
 
-        # Lerp color between base and accent based on amplitude
+        # --- Brightness: base 2%, peak hard-capped at 15% ---
+        base_alpha  = 0.02
+        peak_alpha  = 0.15
+        t = min(amp * 2.0, 1.0)  # map 0–0.5 RMS to 0–1
+        frame_alpha = base_alpha + (peak_alpha - base_alpha) * t  # 0.02–0.15
+
+        # --- Color: lerp base → accent ---
         r1, g1, b1 = self.color
         r2, g2, b2 = self.color2
-        t = min(amplitude * 1.5, 1.0)
         cr = int((r1 + (r2 - r1) * t) * 255)
         cg = int((g1 + (g2 - g1) * t) * 255)
         cb = int((b1 + (b2 - b1) * t) * 255)
 
-        # Overall alpha for this frame
-        frame_alpha = base_alpha + (peak_alpha - base_alpha) * t
+        # --- Spatial gradient: only left/right edges ---
+        dist_field = self._get_dist_x(W, H)  # 0=edge, 1+=center
 
-        # Build gradient mask: bright at edges, transparent at center
-        # Use numpy distance field from edges
-        y_idx = np.arange(H, dtype=np.float32)
-        x_idx = np.arange(W, dtype=np.float32)
+        # Glow falloff power: tighter glow at higher intensity
+        glow_power = 2.0 - 0.8 * (self.glow_intensity / 10.0)  # 1.2–2.0
+        glow_mask = np.clip(1.0 - dist_field ** glow_power, 0.0, 1.0)
 
-        # Normalized distance from each edge (0=edge, 1=center)
-        dist_top    = y_idx / (H * 0.5)          # top edge
-        dist_bottom = (H - 1 - y_idx) / (H * 0.5)
-        dist_left   = x_idx / (W * 0.5)
-        dist_right  = (W - 1 - x_idx) / (W * 0.5)
-
-        # Minimum distance to any edge (0=at edge, 1+=center)
-        # Build 2D field
-        dist_y = np.minimum(dist_top, dist_bottom)[:, np.newaxis]   # (H, 1)
-        dist_x = np.minimum(dist_left, dist_right)[np.newaxis, :]   # (1, W)
-        dist_field = np.minimum(dist_y, dist_x)                     # (H, W)
-
-        # Glow falloff: edge is bright (1.0), center fades to 0
-        # Use smooth power curve: 1 - dist^power
-        glow_power = 1.8 - 0.8 * (self.glow_intensity / 10.0)  # tighter glow at high intensity
-        glow_mask = np.clip(1.0 - dist_field ** glow_power, 0, 1)
-
-        # Soft inner edge: don't let glow go past ~40% inward
-        inner_fade_radius = 0.35 + 0.25 * (self.glow_intensity / 10.0)
-        fade = np.clip(1.0 - (dist_field / inner_fade_radius), 0, 1)
+        # Inner fade: limit glow reach to ~30% of half-width from each edge
+        inner_fade_radius = 0.28 + 0.15 * (self.glow_intensity / 10.0)  # 0.28–0.43
+        fade = np.clip(1.0 - dist_field / inner_fade_radius, 0.0, 1.0)
         glow_mask = glow_mask * fade
 
-        # Convert to alpha channel (0-255)
-        alpha_arr = (glow_mask * frame_alpha * 255).astype(np.uint8)
+        # Final alpha
+        alpha_arr = (glow_mask * frame_alpha * 255).clip(0, 255).astype(np.uint8)
 
-        # Build RGBA image
+        # Build RGBA
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
         rgba[:, :, 0] = cr
         rgba[:, :, 1] = cg
