@@ -639,7 +639,8 @@ class GlowBottomWaveStyle:
 
         # ---- Layer 1: bottom glow gradient (GPU) ----
         dist_field = self._get_dist_cache(W, H)   # (H, W) GPU tensor, 0=bottom
-        reach = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40
+        reach_base = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40
+        reach = reach_base * (0.3 + 0.7 * t_amp)   # dynamic height: quiet=30%, loud=100%
         t_dist = (dist_field / reach).clamp(0.0, 1.0)
         # smootherstep of (1 - t_dist)
         s = 1.0 - t_dist
@@ -702,7 +703,8 @@ class GlowBottomWaveStyle:
         cb = int((b1 + (b2-b1)*t_amp) * 255)
 
         dist_field = self._get_dist_cache(W, H)
-        reach = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40
+        reach_base = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40
+        reach = reach_base * (0.3 + 0.7 * t_amp)
         t_dist = np.clip(dist_field / reach, 0.0, 1.0)
         s = 1.0 - t_dist
         glow_mask  = s*s*s*(s*(s*6.0-15.0)+10.0)
