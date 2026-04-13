@@ -627,42 +627,43 @@ class GlowBottomWaveStyle:
         t_time = fi / fps
         x_norm = np.linspace(0.0, 1.0, W, dtype=np.float32)  # (W,)
 
-        # Max wave height: 12% of frame height, modulated by amplitude
-        max_height_px = H * 0.12 * (0.4 + 0.6 * t_amp)
+        # Max wave oscillation: 8% of frame height, modulated by amplitude
+        max_osc_px = H * 0.08 * (0.4 + 0.6 * t_amp)
 
         # Build alpha accumulator for wave lines
         wave_alpha = np.zeros((H, W), dtype=np.float32)  # (H, W)
 
-        # Wave line configs: offset, thickness, brightness weight
+        # Wave line configs: (y_base_frac_from_bottom, sigma_px, weight)
+        # y_base_frac: 0.0 = bottom edge, positive = upward into frame
         line_cfgs = [
-            # (y_offset_frac, thickness_px, weight, color_t)
-            (0.00, 1.5, 1.00, 1.0),   # center: bright white-blue
-            (0.00, 4.0, 0.35, 0.8),   # center glow halo
-            (0.05, 1.0, 0.60, 0.7),   # slightly offset
-            (-0.05, 1.0, 0.60, 0.7),
-            (0.10, 0.8, 0.30, 0.5),
-            (-0.10, 0.8, 0.30, 0.5),
+            (0.06, 3.0, 1.00),   # main line, 6% up from bottom
+            (0.06, 8.0, 0.40),   # glow halo around main line
+            (0.10, 2.0, 0.65),   # secondary line slightly higher
+            (0.10, 6.0, 0.25),   # halo for secondary
+            (0.03, 1.5, 0.50),   # thin accent near bottom
+            (0.13, 1.5, 0.30),   # thin accent further up
         ]
 
-        for k, (y_off_frac, thick, weight, _) in enumerate(line_cfgs[:self._n_lines]):
-            # Compute wave shape for this line
+        for k, (y_base_frac, sigma, weight) in enumerate(line_cfgs[:self._n_lines]):
+            # Compute wave oscillation for this line
             wave_y = np.zeros(W, dtype=np.float32)
             for i in range(len(self._freqs)):
                 phase_t = self._phases[i] + t_time * self._speeds[i] * 2.0 * math.pi
                 wave_y += self._wamps[i] * np.sin(
-                    self._freqs[i] * x_norm * 2.0 * math.pi + phase_t + k * 0.8
+                    self._freqs[i] * x_norm * 2.0 * math.pi + phase_t + k * 0.9
                 )
-            # Scale: wave_y in [-1, 1] → pixel height above bottom edge
-            # Center at bottom (y = H-1), wave goes upward
-            center_y_px = (H - 1) + y_off_frac * max_height_px
-            wave_px = wave_y * max_height_px  # positive = up = lower y index
-            anchor_row = center_y_px - wave_px   # (W,) float row positions
+            # wave_y in [-1, 1]; scale to oscillation pixels
+            # Base center: y_base_frac * H up from bottom edge
+            #   In pixel coords: row = H-1 - y_base_frac * H  (lower row = bottom)
+            base_row = (H - 1) - y_base_frac * H
+            # Oscillation: positive wave_y moves line further up (row decreases)
+            anchor_row = base_row - wave_y * max_osc_px  # (W,) float row positions
+            anchor_row = np.clip(anchor_row, 0, H - 1)
 
-            # For each column, draw a soft Gaussian blob around anchor_row
+            # Gaussian blob around anchor_row per column
             y_idx = np.arange(H, dtype=np.float32)[:, np.newaxis]  # (H, 1)
             dist_px = np.abs(y_idx - anchor_row[np.newaxis, :])     # (H, W)
-            sigma = thick
-            line_mask = np.exp(-0.5 * (dist_px / sigma) ** 2)       # Gaussian falloff
+            line_mask = np.exp(-0.5 * (dist_px / sigma) ** 2)
             wave_alpha += line_mask * weight
 
         wave_alpha = np.clip(wave_alpha, 0.0, 1.0)
