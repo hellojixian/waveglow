@@ -662,7 +662,11 @@ class GlowBottomWaveStyle:
 
         wave_alpha_gpu = torch.zeros(H, W, dtype=torch.float32, device=dev)
 
+        # All lines converge to center line when silent, spread apart with amplitude
+        base_frac_center = self._line_cfgs[0][0]
         for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
+            spread_frac = (y_base_frac - base_frac_center) * t_amp
+            effective_frac = base_frac_center + spread_frac
             # V17 style: scrolling sine (t_time drives phase = horizontal scroll)
             wave_y = torch.zeros(W, dtype=torch.float32, device=dev)
             for i in range(len(self._freqs)):
@@ -671,7 +675,7 @@ class GlowBottomWaveStyle:
                     float(self._freqs[i]) * x_norm * (2.0 * math.pi) + phase_t + k * 0.9
                 )
             # Anchor row: distance from bottom, converted to pixel row
-            base_row   = (H - 1) - y_base_frac * H
+            base_row   = (H - 1) - effective_frac * H
             anchor_row = (base_row - wave_y * max_osc).clamp(0, H - 1)  # (W,)
 
             # Gaussian blob: (H,1) vs (1,W) broadcast
@@ -723,14 +727,17 @@ class GlowBottomWaveStyle:
         y_idx    = np.arange(H, dtype=np.float32)[:, np.newaxis]
         wave_alpha = np.zeros((H, W), dtype=np.float32)
 
+        base_frac_center = self._line_cfgs[0][0]
         for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
+            spread_frac = (y_base_frac - base_frac_center) * t_amp
+            effective_frac = base_frac_center + spread_frac
             wave_y = np.zeros(W, dtype=np.float32)
             for i in range(len(self._freqs)):
                 phase_t = self._phases[i] + t_time * self._speeds[i] * 2.0 * math.pi
                 wave_y += self._wamps[i] * np.sin(
                     self._freqs[i] * x_norm * 2.0 * math.pi + phase_t + k * 0.9
                 )
-            base_row   = (H - 1) - y_base_frac * H
+            base_row   = (H - 1) - effective_frac * H
             anchor_row = np.clip(base_row - wave_y * max_osc, 0, H - 1)
             dist_px    = np.abs(y_idx - anchor_row[np.newaxis, :])
             wave_alpha += np.exp(-0.5 * (dist_px / sigma) ** 2) * weight
