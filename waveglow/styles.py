@@ -8,42 +8,105 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 
+# Gradient color stops: (position 0-1, R, G, B) along x-axis per line type
+# Each line type has its own gradient palette for visual layering
+LINE_GRADIENTS = [
+    # core: white → ice blue → bright blue
+    [(0.0, 255, 255, 255), (0.3, 200, 225, 255), (0.6, 120, 185, 255), (1.0, 77, 158, 255)],
+    # near-white: same but slightly dimmer
+    [(0.0, 220, 235, 255), (0.4, 160, 200, 255), (0.8, 90, 160, 255), (1.0, 60, 120, 230)],
+    # bright blue
+    [(0.0, 150, 200, 255), (0.35, 77, 158, 255), (0.7, 50, 110, 220), (1.0, 30, 80, 190)],
+    # blue
+    [(0.0, 100, 160, 240), (0.4, 60, 120, 210), (0.8, 35, 85, 175), (1.0, 20, 60, 150)],
+    # mid blue
+    [(0.0, 80, 130, 210), (0.5, 45, 90, 180), (1.0, 20, 55, 140)],
+    # deep blue
+    [(0.0, 55, 100, 190), (0.5, 30, 70, 155), (1.0, 15, 45, 120)],
+    # deeper blue
+    [(0.0, 40, 80, 165), (0.5, 20, 55, 130), (1.0, 10, 35, 100)],
+    # navy
+    [(0.0, 25, 60, 140), (0.5, 15, 40, 110), (1.0, 8, 25, 80)],
+]
+
+
+def _interp_gradient(stops, t):
+    """Linear interpolation across gradient stops. t in [0,1]."""
+    t = max(0.0, min(1.0, t))
+    for i in range(len(stops) - 1):
+        p0, *c0 = stops[i]
+        p1, *c1 = stops[i + 1]
+        if p0 <= t <= p1:
+            f = (t - p0) / (p1 - p0) if p1 > p0 else 0
+            return tuple(int(c0[j] + (c1[j] - c0[j]) * f) for j in range(3))
+    return tuple(stops[-1][1:])
+
+
 class PlasmaStyle:
     """
     Multi-line sine wave overlay with glow — organic plasma/neon aesthetic.
+    Features:
+    - Dynamic line width that breathes with amplitude and position
+    - Per-segment x-axis gradient color (white core → blue edge)
+    - Multi-layer glow blur
+    - Independent phase/freq per line for organic motion
     """
 
     DEFAULT_LINE_CONFIGS = [
-        # (color_rgb_01, base_alpha, phase, freq_mult, amp_mult)
-        ((1.0, 1.0, 1.0),   1.00,  0.00,  1.00,  1.00),  # white core
-        ((0.86, 0.92, 1.0), 0.85,  0.08,  1.02,  0.97),  # near-white
-        ((0.47, 0.71, 1.0), 0.90,  -0.10, 0.98,  0.93),  # bright blue
-        ((0.31, 0.59, 1.0), 0.80,  0.18,  1.06,  0.88),  # blue
-        ((0.24, 0.47, 0.94),0.70,  -0.25, 0.92,  0.82),  # mid blue
-        ((0.16, 0.35, 0.82),0.60,  0.40,  1.12,  0.75),  # deep blue
-        ((0.08, 0.24, 0.71),0.50,  -0.45, 0.82,  0.68),  # deeper blue
-        ((0.04, 0.16, 0.59),0.35,  0.65,  1.20,  0.60),  # navy
+        # (base_alpha, phase, freq_mult, amp_mult, base_width, gradient_idx)
+        (1.00,  0.00,  1.00,  1.00,  3.5, 0),  # white core — thickest
+        (0.85,  0.08,  1.02,  0.97,  2.5, 1),  # near-white
+        (0.90, -0.10,  0.98,  0.93,  2.0, 2),  # bright blue
+        (0.80,  0.18,  1.06,  0.88,  1.8, 3),  # blue
+        (0.70, -0.25,  0.92,  0.82,  1.5, 4),  # mid blue
+        (0.60,  0.40,  1.12,  0.75,  1.3, 5),  # deep blue
+        (0.50, -0.45,  0.82,  0.68,  1.0, 6),  # deeper blue
+        (0.35,  0.65,  1.20,  0.60,  1.0, 7),  # navy — thinnest
     ]
 
     def __init__(self, color=None, color2=None, glow=5, lines=8):
         self.glow = glow
         self.lines = min(lines, len(self.DEFAULT_LINE_CONFIGS))
-        self.line_configs = self.DEFAULT_LINE_CONFIGS[:self.lines]
-        # color overrides primary and secondary
+        self.line_configs = list(self.DEFAULT_LINE_CONFIGS[:self.lines])
+        self._custom_gradient = None
         if color:
-            r, g, b = color
-            self.line_configs[0] = ((1.0, 1.0, 1.0), 1.00, 0.00, 1.00, 1.00)
-            if self.lines > 1:
-                self.line_configs[2] = ((r, g, b), 0.90, -0.10, 0.98, 0.93)
+            # Build custom gradient from provided color
+            r, g, b = [int(c * 255) for c in color]
+            r2, g2, b2 = [int(c * 255) for c in (color2 or (1.0, 1.0, 1.0))]
+            self._custom_gradient = [
+                (0.0, r2, g2, b2),
+                (0.4, int(r2*.7+r*.3), int(g2*.7+g*.3), int(b2*.7+b*.3)),
+                (0.75, r, g, b),
+                (1.0, int(r*0.55), int(g*0.55), int(b*0.55)),
+            ]
+
+    def _get_color(self, grad_idx, x_pos):
+        """Return (R, G, B) for a given gradient and x position [0,1]."""
+        stops = self._custom_gradient if self._custom_gradient else LINE_GRADIENTS[grad_idx % len(LINE_GRADIENTS)]
+        return _interp_gradient(stops, x_pos)
+
+    def _dynamic_width(self, base_w, x_pos, t, amplitude, line_idx):
+        """
+        Compute line width at position x_pos with breathing animation.
+        Width peaks near center, pulses with amplitude, and has per-line oscillation.
+        """
+        # Center bulge: thicker in the middle, thinner at edges
+        center_envelope = math.sin(x_pos * math.pi) ** 0.6  # [0..1]
+        # Breathing oscillation (each line at different phase)
+        breath = 0.5 + 0.5 * math.sin(t * 1.8 + line_idx * 0.9)
+        # Amplitude reactivity
+        amp_boost = 1.0 + amplitude * 1.5
+        # Combine
+        w = base_w * center_envelope * amp_boost * (0.7 + 0.3 * breath)
+        return max(1, int(round(w)))
 
     def render_frame(self, fi, amplitude, W, H, fps=30):
         img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         t = fi * 0.09
         wave_h = H * 0.40
-        cx = W // 2
         cy = H // 2
 
-        def wave_y(x, phase, freq, amp):
+        def wave_y(x, phase, freq, amp_mult):
             tx = x / W
             edge = min(tx * 5, (1 - tx) * 5, 1.0)
             y = (
@@ -51,19 +114,21 @@ class PlasmaStyle:
                 math.sin(tx * math.pi * 7.1 * freq + t * 1.4 + phase * 2.1) * 0.28 +
                 math.sin(tx * math.pi * 1.8 * freq + t * 0.6 + phase * 0.7) * 0.22
             )
-            return int(cy + y * wave_h * amp * edge)
+            return int(cy + y * wave_h * amp_mult * edge)
 
         glow_scales = self._glow_layers(self.glow)
+        step = 3  # x pixel step — balance quality vs speed
 
-        for color, base_alpha, phase, freq, amp in reversed(self.line_configs):
+        for line_idx, (base_alpha, phase, freq, amp_mult, base_w, grad_idx) in enumerate(reversed(self.line_configs)):
+            real_idx = (self.lines - 1) - line_idx  # original index for gradient
+
             pts = []
-            for x in range(0, W, 2):
-                y = wave_y(x, phase, freq, amplitude)
+            for x in range(0, W, step):
+                y = wave_y(x, phase, freq, amplitude * amp_mult)
                 y = max(1, min(H - 2, y))
                 pts.append((x, y))
 
             effective_alpha = int(255 * base_alpha * min(amplitude * 1.8, 1.0))
-            r, g, b = [int(c * 255) for c in color]
 
             for blur_r, a_mult in glow_scales:
                 a = min(int(effective_alpha * a_mult), 255)
@@ -71,8 +136,19 @@ class PlasmaStyle:
                     continue
                 layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
                 draw = ImageDraw.Draw(layer)
+
                 for i in range(len(pts) - 1):
-                    draw.line([pts[i], pts[i + 1]], fill=(r, g, b, a), width=2)
+                    x0, y0 = pts[i]
+                    x1, y1 = pts[i + 1]
+                    x_pos = x0 / W  # normalized x position [0, 1]
+
+                    # Dynamic width at this position
+                    w = self._dynamic_width(base_w, x_pos, t, amplitude, real_idx)
+                    # Gradient color at this x position
+                    r, g, b = self._get_color(real_idx if not self._custom_gradient else 0, x_pos)
+
+                    draw.line([(x0, y0), (x1, y1)], fill=(r, g, b, a), width=w)
+
                 if blur_r > 0:
                     layer = layer.filter(ImageFilter.GaussianBlur(radius=blur_r))
                 img.alpha_composite(layer)
