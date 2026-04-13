@@ -314,15 +314,35 @@ class GlowEdgeStyle:
         return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
 
     def _get_dist_x(self, W, H):
-        """Left-right only distance field, cached per resolution."""
+        """Elliptical arc distance field: bright on left/right arcs, fades at top/bottom corners."""
         if self._cache_shape != (W, H):
-            x_idx = np.arange(W, dtype=np.float32)
-            # Normalized distance from left/right edge: 0=edge, 1=center
-            dist_left  = x_idx / (W * 0.5)
-            dist_right = (W - 1 - x_idx) / (W * 0.5)
-            dist_x = np.minimum(dist_left, dist_right)  # (W,)
-            # Broadcast to (H, W)
-            self._dist_x_cache = np.broadcast_to(dist_x[np.newaxis, :], (H, W)).copy()
+            # Normalised coords: cx in [-1, 1], cy in [-1, 1]
+            cx = (np.arange(W, dtype=np.float32) / (W * 0.5) - 1.0)  # -1=left, 0=center, 1=right
+            cy = (np.arange(H, dtype=np.float32) / (H * 0.5) - 1.0)  # -1=top,  0=center, 1=bottom
+            CX, CY = np.meshgrid(cx, cy)  # (H, W)
+
+            # For each pixel, distance to the nearest point on the unit ellipse (a=1, b=1).
+            # Approximate: signed radial distance from unit circle edge = 1 - r, clamped.
+            # Use a squashed ellipse: a=1.0 (width), b=0.85 (height) so arcs are tall but curve.
+            a, b = 1.0, 0.85
+            r = np.sqrt((CX / a) ** 2 + (CY / b) ** 2)  # 0=center, 1=ellipse edge
+
+            # Distance FROM the ellipse boundary (positive outside, negative inside).
+            # We want pixels OUTSIDE the ellipse (near the frame edges) to be bright.
+            # dist_from_ellipse: 0 at ellipse, positive inward (toward center), positive outward.
+            # For glow we care about: how close is this pixel to the ellipse?
+            dist_from_ellipse = np.abs(r - 1.0)  # 0=on ellipse boundary
+
+            # But we only want the left/right portions: weight by |CX| / r so top/bottom fade
+            # (When r==0 use 0 to avoid div-by-zero)
+            safe_r = np.where(r < 1e-6, 1e-6, r)
+            side_weight = np.abs(CX) / safe_r  # 1=pure left/right, 0=pure top/bottom
+            # Smooth the weight with smootherstep so corners taper off gracefully
+            side_weight = self._smootherstep(side_weight)
+
+            # Combined: distance in [0, +∞), small near the arc, weighted to zero at top/bottom
+            # Normalise dist so that ~0.25 of frame width = 1.0
+            self._dist_x_cache = dist_from_ellipse / (side_weight + 0.01)
             self._cache_shape = (W, H)
         return self._dist_x_cache
 
