@@ -301,6 +301,18 @@ class GlowEdgeStyle:
         self._cache_shape = None
         self._dist_x_cache = None
 
+    @staticmethod
+    def _smoothstep(x):
+        """Cubic smoothstep: 0→0, 1→1, with zero derivative at endpoints."""
+        x = np.clip(x, 0.0, 1.0)
+        return x * x * (3.0 - 2.0 * x)
+
+    @staticmethod
+    def _smootherstep(x):
+        """Ken Perlin's quintic smoothstep: even smoother S-curve."""
+        x = np.clip(x, 0.0, 1.0)
+        return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+
     def _get_dist_x(self, W, H):
         """Left-right only distance field, cached per resolution."""
         if self._cache_shape != (W, H):
@@ -339,14 +351,12 @@ class GlowEdgeStyle:
         # --- Spatial gradient: only left/right edges ---
         dist_field = self._get_dist_x(W, H)  # 0=edge, 1+=center
 
-        # Glow falloff power: tighter glow at higher intensity
-        glow_power = 2.0 - 0.8 * (self.glow_intensity / 10.0)  # 1.2–2.0
-        glow_mask = np.clip(1.0 - dist_field ** glow_power, 0.0, 1.0)
+        # Glow reach: how far inward the glow extends (fraction of half-width)
+        reach = 0.30 + 0.20 * (self.glow_intensity / 10.0)  # 0.30–0.50
 
-        # Inner fade: limit glow reach to ~30% of half-width from each edge
-        inner_fade_radius = 0.28 + 0.15 * (self.glow_intensity / 10.0)  # 0.28–0.43
-        fade = np.clip(1.0 - dist_field / inner_fade_radius, 0.0, 1.0)
-        glow_mask = glow_mask * fade
+        # Map dist 0..reach → 1..0 using smootherstep for silky S-curve falloff
+        t_dist = np.clip(dist_field / reach, 0.0, 1.0)  # 0=edge bright, 1=reach boundary
+        glow_mask = self._smootherstep(1.0 - t_dist)     # 1 at edge, 0 at reach boundary
 
         # Final alpha
         alpha_arr = (glow_mask * frame_alpha * 255).clip(0, 255).astype(np.uint8)
