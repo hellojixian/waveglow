@@ -16,7 +16,7 @@ def parse_color(s):
 
 
 def add_common_args(parser):
-    parser.add_argument("--style", choices=["plasma", "bars", "envelope", "glow-edge", "glow-top-bottom"], default="plasma")
+    parser.add_argument("--style", choices=["plasma", "bars", "envelope", "glow-edge", "glow-top-bottom", "glow-wave"], default="plasma")
     parser.add_argument("--color", type=parse_color, default=None,
                         help="Primary color r,g,b in [0,1] (default: blue)")
     parser.add_argument("--color2", type=parse_color, default=None,

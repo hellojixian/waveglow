@@ -12,7 +12,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from .audio import read_audio, get_rms_per_frame, get_fft_per_frame, get_envelope
-from .styles import PlasmaStyle, BarsStyle, EnvelopeStyle, GlowEdgeStyle, GlowTopBottomStyle
+from .styles import PlasmaStyle, BarsStyle, EnvelopeStyle, GlowEdgeStyle, GlowTopBottomStyle, GlowWaveEdgeStyle
 
 
 STYLES = {
@@ -21,6 +21,7 @@ STYLES = {
     "envelope": EnvelopeStyle,
     "glow-edge": GlowEdgeStyle,
     "glow-top-bottom": GlowTopBottomStyle,
+    "glow-wave": GlowWaveEdgeStyle,
 }
 
 
@@ -73,6 +74,8 @@ class WaveGlow:
             self.renderer = GlowEdgeStyle(color=color, color2=color2, glow=glow)
         elif style == "glow-top-bottom":
             self.renderer = GlowTopBottomStyle(color=color, color2=color2, glow=glow)
+        elif style == "glow-wave":
+            self.renderer = GlowWaveEdgeStyle(color=color, color2=color2, glow=glow)
 
     def render(self, audio_path, output_path, width=1920, height=200, bg=None, seek=None, duration=None):
         """
@@ -191,7 +194,7 @@ class WaveGlow:
         vid_h = next((s['height'] for s in info['streams'] if s.get('codec_type') == 'video'), 1080)
 
         # glow-edge / glow-top-bottom: full-frame overlay at (0,0) matching video size
-        if self.style_name in ("glow-edge", "glow-top-bottom"):
+        if self.style_name in ("glow-edge", "glow-top-bottom", "glow-wave"):
             width = vid_w
             height = vid_h
             y_position = 0

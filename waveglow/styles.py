@@ -391,6 +391,111 @@ class GlowEdgeStyle:
         return Image.fromarray(rgba, mode="RGBA")
 
 
+class GlowWaveEdgeStyle:
+    """
+    Wave-edge glow: left and right edges emit a living, wavy glow.
+    The edge boundary is NOT a straight line — it's a smoothly animated waveform
+    driven by the audio signal.  Brightness range: 0%–8% (subtle, no harsh flashes).
+    """
+
+    def __init__(self, color=None, color2=None, glow=6, fps=30, **kwargs):
+        self.color  = color  or (0.10, 0.23, 0.42)   # deep blue
+        self.color2 = color2 or (0.30, 0.62, 1.00)   # bright blue
+        self.glow_intensity = max(1, min(10, glow))
+        self.fps = fps
+        # EMA for overall amplitude
+        tau = 0.4
+        self._ema_alpha = 1.0 - math.exp(-1.0 / (fps * tau))
+        self._smoothed_amp = 0.0
+        # Wave phase accumulator — advances each frame for continuous motion
+        self._phase = 0.0
+        # Random frequency / amplitude seeds for multi-octave wave
+        rng = np.random.default_rng(42)
+        self._freqs  = rng.uniform(0.8, 3.5, size=5).astype(np.float32)   # spatial frequencies
+        self._phases = rng.uniform(0, 2 * math.pi, size=5).astype(np.float32)  # initial offsets
+        self._amps   = rng.uniform(0.3, 1.0, size=5).astype(np.float32)        # relative weights
+        self._amps  /= self._amps.sum()  # normalise
+        self._speeds = rng.uniform(0.4, 1.4, size=5).astype(np.float32)   # per-octave time speeds
+
+    @staticmethod
+    def _smootherstep(x):
+        x = np.clip(x, 0.0, 1.0)
+        return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+
+    def render_frame(self, fi, amplitude, W, H, fps=30):
+        # --- Smooth amplitude ---
+        self._smoothed_amp += self._ema_alpha * (amplitude - self._smoothed_amp)
+        amp = self._smoothed_amp
+        t_amp = min(amp * 2.5, 1.0)  # 0→1 response curve
+
+        # --- Brightness: 0%–8% ---
+        base_alpha = 0.00
+        peak_alpha = 0.08
+        frame_alpha = base_alpha + (peak_alpha - base_alpha) * t_amp
+
+        # --- Color lerp ---
+        r1, g1, b1 = self.color
+        r2, g2, b2 = self.color2
+        cr = int((r1 + (r2 - r1) * t_amp) * 255)
+        cg = int((g1 + (g2 - g1) * t_amp) * 255)
+        cb = int((b1 + (b2 - b1) * t_amp) * 255)
+
+        # --- Compute wavy edge boundary (per row) ---
+        # y_norm: 0=top, 1=bottom
+        y_norm = np.linspace(0.0, 1.0, H, dtype=np.float32)
+        t_time = fi / fps  # seconds elapsed
+
+        # Multi-octave sine wave sum along Y axis
+        wave = np.zeros(H, dtype=np.float32)
+        for k in range(len(self._freqs)):
+            phase_t = self._phases[k] + t_time * self._speeds[k] * 2.0 * math.pi
+            wave += self._amps[k] * np.sin(self._freqs[k] * y_norm * 2.0 * math.pi + phase_t)
+        # wave is in [-1, 1]; scale to pixel offset
+        # Max edge displacement: 8% of half-width, modulated by amplitude
+        max_disp_px = W * 0.08 * (0.3 + 0.7 * t_amp)  # more wavy when louder
+        edge_disp = wave * max_disp_px  # (H,) pixel offset from the raw frame edge
+
+        # Glow reach (inward from edge): 15%–30% of half-width
+        reach_frac = 0.15 + 0.15 * (self.glow_intensity / 10.0)
+        reach_px   = W * reach_frac
+
+        # --- Build pixel distance field ---
+        # x_idx: (W,) array of pixel x positions
+        x_idx = np.arange(W, dtype=np.float32)  # 0=left, W-1=right
+
+        # Left edge: wavy boundary at x = edge_disp[row] (from left)
+        # dist_left[row, col] = max(0, col - boundary_left[row])
+        boundary_left  = edge_disp          # (H,) — positive = boundary pushes inward
+        boundary_right = (W - 1) - edge_disp  # (H,) — symmetric on the right
+
+        # Broadcast: (H,1) vs (1,W)
+        BL = boundary_left[:, np.newaxis]   # (H, 1)
+        BR = boundary_right[:, np.newaxis]  # (H, 1)
+        XI = x_idx[np.newaxis, :]           # (1, W)
+
+        dist_left_arr  = np.maximum(0.0, XI - BL)          # 0 on/outside left boundary
+        dist_right_arr = np.maximum(0.0, BR - XI)          # 0 on/outside right boundary (mirrored)
+        # Wait — we want INSIDE distance (from boundary inward to center)
+        # dist_left = how far pixel is from left wavy boundary (0 at boundary, grows inward)
+        dist_left_from_boundary  = np.abs(XI - BL)  # closest distance to left edge curve
+        dist_right_from_boundary = np.abs(XI - BR)  # closest distance to right edge curve
+        dist_field = np.minimum(dist_left_from_boundary, dist_right_from_boundary)  # (H, W)
+
+        # Normalise by reach_px and apply smootherstep
+        t_dist = np.clip(dist_field / reach_px, 0.0, 1.0)
+        glow_mask = self._smootherstep(1.0 - t_dist)  # bright near edge, fades inward
+
+        # Final alpha
+        alpha_arr = (glow_mask * frame_alpha * 255).clip(0, 255).astype(np.uint8)
+
+        rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        rgba[:, :, 0] = cr
+        rgba[:, :, 1] = cg
+        rgba[:, :, 2] = cb
+        rgba[:, :, 3] = alpha_arr
+        return Image.fromarray(rgba, mode="RGBA")
+
+
 class GlowTopBottomStyle(GlowEdgeStyle):
     """
     Same breathing glow as GlowEdgeStyle but emitting from top and bottom edges.
