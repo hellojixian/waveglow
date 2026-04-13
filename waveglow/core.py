@@ -242,6 +242,9 @@ class WaveGlow:
 
             ff_proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE)
 
+            # Pre-compute PCM window size for real-waveform styles
+            pcm_win_samples = int(sr / self.fps)  # samples per frame
+
             for fi in tqdm(range(n_frames), unit=" frames", ncols=80):
                 amp = float(rms[fi]) if fi < len(rms) else 0.0
                 amp = min(amp * 2.0, 1.0)
@@ -251,6 +254,12 @@ class WaveGlow:
                     frame = self.renderer.render_frame(fi, fft_frame, width, height, self.fps)
                 elif self.style_name == "envelope":
                     frame = self.renderer.render_frame(fi, env, width, height, self.fps)
+                elif self.style_name == "glow-bottom-wave":
+                    # Pass real PCM window so wave shape matches actual audio
+                    start = fi * pcm_win_samples
+                    end   = start + pcm_win_samples
+                    pcm_win = wav[start:end] if start < len(wav) else np.zeros(pcm_win_samples)
+                    frame = self.renderer.render_frame(fi, amp, width, height, self.fps, pcm_window=pcm_win)
                 else:
                     frame = self.renderer.render_frame(fi, amp, width, height, self.fps)
 

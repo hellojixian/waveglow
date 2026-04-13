@@ -615,12 +615,12 @@ class GlowBottomWaveStyle:
             self._cache_shape = (W, H)
         return self._dist_cache
 
-    def render_frame(self, fi, amplitude, W, H, fps=30):
+    def render_frame(self, fi, amplitude, W, H, fps=30, pcm_window=None):
         if self._torch is not None and self._device.type == "cuda":
-            return self._render_gpu(fi, amplitude, W, H, fps)
-        return self._render_cpu(fi, amplitude, W, H, fps)
+            return self._render_gpu(fi, amplitude, W, H, fps, pcm_window)
+        return self._render_cpu(fi, amplitude, W, H, fps, pcm_window)
 
-    def _render_gpu(self, fi, amplitude, W, H, fps):
+    def _render_gpu(self, fi, amplitude, W, H, fps, pcm_window=None):
         torch = self._torch
         dev   = self._device
 
@@ -653,17 +653,28 @@ class GlowBottomWaveStyle:
         x_norm    = torch.linspace(0.0, 1.0, W, dtype=torch.float32, device=dev)  # (W,)
         y_idx_col = torch.arange(H, dtype=torch.float32, device=dev).unsqueeze(1)  # (H,1)
 
-        # Pre-compute per-octave phases (scalars, on CPU is fine)
+        # Pre-compute base waveform shape from real PCM audio or sine fallback
+        if pcm_window is not None and len(pcm_window) > 1:
+            pcm_arr = np.asarray(pcm_window, dtype=np.float32)
+            indices = np.linspace(0, len(pcm_arr) - 1, W)
+            resampled = np.interp(indices, np.arange(len(pcm_arr)), pcm_arr)
+            base_wave_shape = torch.tensor(resampled, dtype=torch.float32, device=dev)
+        else:
+            base_wave_shape = None
+
         wave_alpha_gpu = torch.zeros(H, W, dtype=torch.float32, device=dev)
 
         for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
-            # Multi-octave sine sum along X
-            wave_y = torch.zeros(W, dtype=torch.float32, device=dev)
-            for i in range(len(self._freqs)):
-                # Static phase only — no t_time drift, so lines don't scroll horizontally
-                wave_y = wave_y + float(self._wamps[i]) * torch.sin(
-                    float(self._freqs[i]) * x_norm * (2.0 * math.pi) + float(self._phases[i]) + k * 0.9
-                )
+            # Use real audio waveform if available, else sine fallback
+            if base_wave_shape is not None:
+                roll_offset = int(k * W // (self._n_lines * 2))
+                wave_y = torch.roll(base_wave_shape, roll_offset)
+            else:
+                wave_y = torch.zeros(W, dtype=torch.float32, device=dev)
+                for i in range(len(self._freqs)):
+                    wave_y = wave_y + float(self._wamps[i]) * torch.sin(
+                        float(self._freqs[i]) * x_norm * (2.0 * math.pi) + float(self._phases[i]) + k * 0.9
+                    )
             # Anchor row: distance from bottom, converted to pixel row
             base_row   = (H - 1) - y_base_frac * H
             anchor_row = (base_row - wave_y * max_osc).clamp(0, H - 1)  # (W,)
@@ -692,7 +703,7 @@ class GlowBottomWaveStyle:
         rgba_np = rgba_gpu.cpu().numpy()
         return Image.fromarray(rgba_np, mode="RGBA")
 
-    def _render_cpu(self, fi, amplitude, W, H, fps):
+    def _render_cpu(self, fi, amplitude, W, H, fps, pcm_window=None):
         """CPU fallback (numpy) — identical logic, no torch dependency."""
         self._smoothed_amp += self._ema_alpha * (amplitude - self._smoothed_amp)
         amp   = self._smoothed_amp
@@ -718,12 +729,24 @@ class GlowBottomWaveStyle:
         y_idx    = np.arange(H, dtype=np.float32)[:, np.newaxis]
         wave_alpha = np.zeros((H, W), dtype=np.float32)
 
+        # Base waveform shape from real PCM audio or sine fallback
+        if pcm_window is not None and len(pcm_window) > 1:
+            pcm_arr = np.asarray(pcm_window, dtype=np.float32)
+            indices = np.linspace(0, len(pcm_arr) - 1, W)
+            base_wave_shape = np.interp(indices, np.arange(len(pcm_arr)), pcm_arr)
+        else:
+            base_wave_shape = None
+
         for k, (y_base_frac, sigma, weight) in enumerate(self._line_cfgs[:self._n_lines]):
-            wave_y = np.zeros(W, dtype=np.float32)
-            for i in range(len(self._freqs)):
-                wave_y += self._wamps[i] * np.sin(
-                    self._freqs[i] * x_norm * 2.0 * math.pi + self._phases[i] + k * 0.9
-                )
+            if base_wave_shape is not None:
+                roll_offset = int(k * W // (self._n_lines * 2))
+                wave_y = np.roll(base_wave_shape, roll_offset)
+            else:
+                wave_y = np.zeros(W, dtype=np.float32)
+                for i in range(len(self._freqs)):
+                    wave_y += self._wamps[i] * np.sin(
+                        self._freqs[i] * x_norm * 2.0 * math.pi + self._phases[i] + k * 0.9
+                    )
             base_row   = (H - 1) - y_base_frac * H
             anchor_row = np.clip(base_row - wave_y * max_osc, 0, H - 1)
             dist_px    = np.abs(y_idx - anchor_row[np.newaxis, :])
