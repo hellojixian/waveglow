@@ -550,3 +550,134 @@ class GlowTopBottomStyle(GlowEdgeStyle):
             self._dist_x_cache = np.broadcast_to(dist_y[:, np.newaxis], (H, W)).copy()
             self._cache_shape = (W, H)
         return self._dist_x_cache
+
+
+class GlowBottomWaveStyle:
+    """
+    Bottom-edge glow + plasma waveform overlay.
+    - Soft breathing gradient from the bottom edge upward (smootherstep, 40% height)
+    - Multi-line plasma wave centered ON the bottom edge (wave floats upward)
+    - Brightness: 0%–15%
+    """
+
+    def __init__(self, color=None, color2=None, glow=6, fps=30, **kwargs):
+        self.color  = color  or (0.10, 0.23, 0.42)   # deep blue
+        self.color2 = color2 or (0.30, 0.62, 1.00)   # bright blue
+        self.glow_intensity = max(1, min(10, glow))
+        self.fps = fps
+        tau = 0.4
+        self._ema_alpha = 1.0 - math.exp(-1.0 / (fps * tau))
+        self._smoothed_amp = 0.0
+        self._cache_shape = None
+        self._dist_cache = None
+        # Wave parameters (5 octaves, same seed as PlasmaStyle for consistency)
+        rng = np.random.default_rng(7)
+        self._freqs  = rng.uniform(0.5, 2.5, size=5).astype(np.float32)
+        self._phases = rng.uniform(0, 2 * math.pi, size=5).astype(np.float32)
+        self._wamps  = rng.uniform(0.3, 1.0, size=5).astype(np.float32)
+        self._wamps /= self._wamps.sum()
+        self._speeds = rng.uniform(0.3, 1.0, size=5).astype(np.float32)
+        # Number of wave lines to draw
+        self._n_lines = 6
+
+    @staticmethod
+    def _smootherstep(x):
+        x = np.clip(x, 0.0, 1.0)
+        return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+
+    def _bottom_dist_field(self, W, H):
+        """Normalised distance from BOTTOM edge only: 0=bottom, 1=top."""
+        if self._cache_shape != (W, H):
+            y_idx = np.arange(H, dtype=np.float32)
+            dist_bottom = (H - 1 - y_idx) / float(H - 1)  # 0=bottom row, 1=top row
+            self._dist_cache = np.broadcast_to(dist_bottom[:, np.newaxis], (H, W)).copy()
+            self._cache_shape = (W, H)
+        return self._dist_cache
+
+    def render_frame(self, fi, amplitude, W, H, fps=30):
+        # --- Smooth amplitude ---
+        self._smoothed_amp += self._ema_alpha * (amplitude - self._smoothed_amp)
+        amp = self._smoothed_amp
+        t_amp = min(amp * 2.0, 1.0)
+
+        # --- Brightness 0%–15% ---
+        base_alpha = 0.00
+        peak_alpha = 0.15
+        frame_alpha = base_alpha + (peak_alpha - base_alpha) * t_amp
+
+        # --- Color lerp deep→bright blue ---
+        r1, g1, b1 = self.color
+        r2, g2, b2 = self.color2
+        cr = int((r1 + (r2 - r1) * t_amp) * 255)
+        cg = int((g1 + (g2 - g1) * t_amp) * 255)
+        cb = int((b1 + (b2 - b1) * t_amp) * 255)
+
+        # ============================================================
+        # Layer 1: bottom gradient glow (40% height)
+        # ============================================================
+        dist_field = self._bottom_dist_field(W, H)   # 0=bottom, 1=top
+        reach = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * 0.40  # 40% of original
+        t_dist = np.clip(dist_field / reach, 0.0, 1.0)
+        glow_mask = self._smootherstep(1.0 - t_dist)    # 1 at bottom, 0 at reach height
+        alpha_glow = glow_mask * frame_alpha             # (H, W) in [0, 1]
+
+        # ============================================================
+        # Layer 2: plasma wave lines centered on bottom edge
+        # ============================================================
+        t_time = fi / fps
+        x_norm = np.linspace(0.0, 1.0, W, dtype=np.float32)  # (W,)
+
+        # Max wave height: 12% of frame height, modulated by amplitude
+        max_height_px = H * 0.12 * (0.4 + 0.6 * t_amp)
+
+        # Build alpha accumulator for wave lines
+        wave_alpha = np.zeros((H, W), dtype=np.float32)  # (H, W)
+
+        # Wave line configs: offset, thickness, brightness weight
+        line_cfgs = [
+            # (y_offset_frac, thickness_px, weight, color_t)
+            (0.00, 1.5, 1.00, 1.0),   # center: bright white-blue
+            (0.00, 4.0, 0.35, 0.8),   # center glow halo
+            (0.05, 1.0, 0.60, 0.7),   # slightly offset
+            (-0.05, 1.0, 0.60, 0.7),
+            (0.10, 0.8, 0.30, 0.5),
+            (-0.10, 0.8, 0.30, 0.5),
+        ]
+
+        for k, (y_off_frac, thick, weight, _) in enumerate(line_cfgs[:self._n_lines]):
+            # Compute wave shape for this line
+            wave_y = np.zeros(W, dtype=np.float32)
+            for i in range(len(self._freqs)):
+                phase_t = self._phases[i] + t_time * self._speeds[i] * 2.0 * math.pi
+                wave_y += self._wamps[i] * np.sin(
+                    self._freqs[i] * x_norm * 2.0 * math.pi + phase_t + k * 0.8
+                )
+            # Scale: wave_y in [-1, 1] → pixel height above bottom edge
+            # Center at bottom (y = H-1), wave goes upward
+            center_y_px = (H - 1) + y_off_frac * max_height_px
+            wave_px = wave_y * max_height_px  # positive = up = lower y index
+            anchor_row = center_y_px - wave_px   # (W,) float row positions
+
+            # For each column, draw a soft Gaussian blob around anchor_row
+            y_idx = np.arange(H, dtype=np.float32)[:, np.newaxis]  # (H, 1)
+            dist_px = np.abs(y_idx - anchor_row[np.newaxis, :])     # (H, W)
+            sigma = thick
+            line_mask = np.exp(-0.5 * (dist_px / sigma) ** 2)       # Gaussian falloff
+            wave_alpha += line_mask * weight
+
+        wave_alpha = np.clip(wave_alpha, 0.0, 1.0)
+        # Wave brightness: same frame_alpha envelope
+        alpha_wave = wave_alpha * frame_alpha * 0.8   # slightly dimmer than glow
+
+        # ============================================================
+        # Combine: max-blend glow + wave layers
+        # ============================================================
+        alpha_combined = np.clip(np.maximum(alpha_glow, alpha_wave), 0.0, 1.0)
+        alpha_arr = (alpha_combined * 255).astype(np.uint8)
+
+        rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        rgba[:, :, 0] = cr
+        rgba[:, :, 1] = cg
+        rgba[:, :, 2] = cb
+        rgba[:, :, 3] = alpha_arr
+        return Image.fromarray(rgba, mode="RGBA")
