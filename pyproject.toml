@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "waveglow"
+version = "0.1.0"
+description = "Beautiful audio waveform visualizations with glow effects and transparent overlays"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Jixian Wang", email = "jixian@example.com" }]
+keywords = ["audio", "waveform", "visualization", "ffmpeg", "video"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Multimedia :: Video",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "Pillow",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "ruff"]
+
+[project.scripts]
+waveglow = "waveglow.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hellojixian/waveglow"
+Repository = "https://github.com/hellojixian/waveglow"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["waveglow*"]
