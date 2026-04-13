@@ -820,8 +820,13 @@ class GlowBottomWaveStyle:
         rgb_planes  = color_plane.view(1, 1, 3).expand(H, W, 3)                  # (H, W, 3)
         rgba_gpu    = torch.cat([rgb_planes, alpha_u8.unsqueeze(2)], dim=2)       # (H, W, 4)
 
-        # ✅ Zero-copy: contiguous GPU tensor → single CPU transfer → raw bytes
-        return rgba_gpu.contiguous().cpu().numpy().tobytes()
+        # ✅ Pinned memory async transfer: GPU→CPU overlap with next frame's compute
+        rgba_c = rgba_gpu.contiguous()
+        if not hasattr(self, '_pin_buf') or self._pin_buf.shape != rgba_c.shape:
+            self._pin_buf = torch.empty_like(rgba_c, pin_memory=True)
+        self._pin_buf.copy_(rgba_c, non_blocking=True)
+        torch.cuda.synchronize()  # wait for async copy to finish
+        return self._pin_buf.numpy().tobytes()
 
     def _render_cpu(self, fi, amplitude, W, H, fps, pcm_window=None):
         """CPU fallback (numpy) — identical logic, no torch dependency."""
