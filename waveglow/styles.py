@@ -498,8 +498,45 @@ class GlowWaveEdgeStyle:
 
 class GlowTopBottomStyle(GlowEdgeStyle):
     """
-    Same breathing glow as GlowEdgeStyle but emitting from top and bottom edges.
+    Breathing glow from top and bottom edges only.
+    Glow height is 40% of the original GlowEdgeStyle reach.
     """
+
+    # Scale factor applied to reach so the glow band is narrower
+    REACH_SCALE = 0.40
+
+    def render_frame(self, fi, amplitude, W, H, fps=30):
+        """Same as parent but reach scaled to 40%."""
+        self._smoothed_amp += self._ema_alpha * (amplitude - self._smoothed_amp)
+        amp = self._smoothed_amp
+
+        base_alpha = 0.02
+        peak_alpha = 0.15
+        t = min(amp * 2.0, 1.0)
+        frame_alpha = base_alpha + (peak_alpha - base_alpha) * t
+
+        r1, g1, b1 = self.color
+        r2, g2, b2 = self.color2
+        cr = int((r1 + (r2 - r1) * t) * 255)
+        cg = int((g1 + (g2 - g1) * t) * 255)
+        cb = int((b1 + (b2 - b1) * t) * 255)
+
+        dist_field = self._get_dist_x(W, H)
+
+        # reach at 40% of original
+        reach = (0.30 + 0.20 * (self.glow_intensity / 10.0)) * self.REACH_SCALE
+
+        t_dist = np.clip(dist_field / reach, 0.0, 1.0)
+        glow_mask = self._smootherstep(1.0 - t_dist)
+
+        alpha_arr = (glow_mask * frame_alpha * 255).clip(0, 255).astype(np.uint8)
+
+        rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        rgba[:, :, 0] = cr
+        rgba[:, :, 1] = cg
+        rgba[:, :, 2] = cb
+        rgba[:, :, 3] = alpha_arr
+        return Image.fromarray(rgba, mode="RGBA")
 
     def _get_dist_x(self, W, H):
         """Top-bottom distance field (reuses parent smootherstep + caching)."""
