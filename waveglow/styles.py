@@ -591,13 +591,14 @@ class GlowBottomWaveStyle:
         self._n_lines = 6
 
         # Line configs: (y_base_frac_from_bottom, sigma_px, weight)
+        # Lowered closer to bottom edge (was 0.06/0.10/0.03/0.13)
         self._line_cfgs = [
-            (0.06, 3.0, 1.00),
-            (0.06, 8.0, 0.40),
-            (0.10, 2.0, 0.65),
-            (0.10, 6.0, 0.25),
-            (0.03, 1.5, 0.50),
-            (0.13, 1.5, 0.30),
+            (0.03, 3.0, 1.00),
+            (0.03, 8.0, 0.40),
+            (0.05, 2.0, 0.65),
+            (0.05, 6.0, 0.25),
+            (0.01, 1.5, 0.50),
+            (0.07, 1.5, 0.30),
         ]
 
     def _get_dist_cache(self, W, H):
@@ -685,19 +686,31 @@ class GlowBottomWaveStyle:
             wave_alpha_gpu = wave_alpha_gpu + line_mask * weight
 
         wave_alpha_gpu = wave_alpha_gpu.clamp(0.0, 1.0)
-        # Wave uses independent brighter alpha (0–80%), not tied to dim glow alpha
         wave_frame_alpha = 0.8 * t_amp
         alpha_wave = wave_alpha_gpu * wave_frame_alpha
 
-        # ---- Combine ----
-        alpha_combined = torch.maximum(alpha_glow, alpha_wave).clamp(0.0, 1.0)
-        alpha_u8 = (alpha_combined * 255).to(torch.uint8)
+        # ---- Combine: glow=blue, wave=white ----
+        # Glow layer (blue)
+        glow_a = alpha_glow.clamp(0.0, 1.0)
+        # Wave layer (white)
+        wave_a = alpha_wave.clamp(0.0, 1.0)
 
-        # Build RGBA tensor on GPU, then transfer to CPU once
+        # Composite: start transparent, blend glow (blue), then blend wave (white)
+        # R channel: lerp toward blue on glow, white on wave
+        # Simple approach: render two separate color contributions, take max alpha
+        alpha_combined = torch.maximum(glow_a, wave_a).clamp(0.0, 1.0)
+
+        # Per-pixel color: weighted blend of blue (glow) and white (wave)
+        safe_alpha = alpha_combined.clamp(min=1e-6)
+        r_out = ((glow_a * float(cr) + wave_a * 255.0) / (glow_a + wave_a + 1e-6)).clamp(0, 255)
+        g_out = ((glow_a * float(cg) + wave_a * 255.0) / (glow_a + wave_a + 1e-6)).clamp(0, 255)
+        b_out = ((glow_a * float(cb) + wave_a * 255.0) / (glow_a + wave_a + 1e-6)).clamp(0, 255)
+
+        alpha_u8 = (alpha_combined * 255).to(torch.uint8)
         rgba_gpu = torch.zeros(H, W, 4, dtype=torch.uint8, device=dev)
-        rgba_gpu[:, :, 0] = int(cr)
-        rgba_gpu[:, :, 1] = int(cg)
-        rgba_gpu[:, :, 2] = int(cb)
+        rgba_gpu[:, :, 0] = r_out.to(torch.uint8)
+        rgba_gpu[:, :, 1] = g_out.to(torch.uint8)
+        rgba_gpu[:, :, 2] = b_out.to(torch.uint8)
         rgba_gpu[:, :, 3] = alpha_u8
 
         rgba_np = rgba_gpu.cpu().numpy()
@@ -756,9 +769,17 @@ class GlowBottomWaveStyle:
         wave_frame_alpha = 0.8 * t_amp
         alpha_wave = wave_alpha * wave_frame_alpha
 
-        alpha_combined = np.clip(np.maximum(alpha_glow, alpha_wave), 0.0, 1.0)
+        # ---- Combine: glow=blue, wave=white ----
+        glow_a = np.clip(alpha_glow, 0.0, 1.0)
+        wave_a = np.clip(alpha_wave, 0.0, 1.0)
+        alpha_combined = np.clip(np.maximum(glow_a, wave_a), 0.0, 1.0)
+
+        denom = glow_a + wave_a + 1e-6
+        r_out = np.clip((glow_a * cr    + wave_a * 255.0) / denom, 0, 255).astype(np.uint8)
+        g_out = np.clip((glow_a * cg    + wave_a * 255.0) / denom, 0, 255).astype(np.uint8)
+        b_out = np.clip((glow_a * cb    + wave_a * 255.0) / denom, 0, 255).astype(np.uint8)
         alpha_arr = (alpha_combined * 255).astype(np.uint8)
 
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
-        rgba[:,:,0] = cr;  rgba[:,:,1] = cg;  rgba[:,:,2] = cb;  rgba[:,:,3] = alpha_arr
+        rgba[:,:,0] = r_out;  rgba[:,:,1] = g_out;  rgba[:,:,2] = b_out;  rgba[:,:,3] = alpha_arr
         return Image.fromarray(rgba, mode="RGBA")
