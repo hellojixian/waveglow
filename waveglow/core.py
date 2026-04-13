@@ -12,13 +12,14 @@ from PIL import Image
 from tqdm import tqdm
 
 from .audio import read_audio, get_rms_per_frame, get_fft_per_frame, get_envelope
-from .styles import PlasmaStyle, BarsStyle, EnvelopeStyle
+from .styles import PlasmaStyle, BarsStyle, EnvelopeStyle, GlowEdgeStyle
 
 
 STYLES = {
     "plasma": PlasmaStyle,
     "bars": BarsStyle,
     "envelope": EnvelopeStyle,
+    "glow-edge": GlowEdgeStyle,
 }
 
 
@@ -67,6 +68,8 @@ class WaveGlow:
             self.renderer = BarsStyle(color=color, color2=color2, glow=glow, bars=bars)
         elif style == "envelope":
             self.renderer = EnvelopeStyle(color=color, color2=color2, glow=glow, bars=bars, speed=speed)
+        elif style == "glow-edge":
+            self.renderer = GlowEdgeStyle(color=color, color2=color2, glow=glow)
 
     def render(self, audio_path, output_path, width=1920, height=200, bg=None, seek=None, duration=None):
         """
@@ -174,16 +177,22 @@ class WaveGlow:
             env = get_envelope(wav, sr)
             env = np.pad(env, (0, n_frames * 3))
 
-        # Auto y position: bottom of video
-        if y_position is None:
-            # detect video height
-            import json
-            proc = subprocess.run([
-                'ffprobe', "-loglevel", "panic",
-                str(video_path), '-print_format', 'json', '-show_streams'
-            ], capture_output=True)
-            info = json.loads(proc.stdout.decode('utf-8'))
-            vid_h = next((s['height'] for s in info['streams'] if s.get('codec_type') == 'video'), 1080)
+        # Detect video dimensions
+        import json
+        proc = subprocess.run([
+            'ffprobe', "-loglevel", "panic",
+            str(video_path), '-print_format', 'json', '-show_streams'
+        ], capture_output=True)
+        info = json.loads(proc.stdout.decode('utf-8'))
+        vid_w = next((s['width']  for s in info['streams'] if s.get('codec_type') == 'video'), 1920)
+        vid_h = next((s['height'] for s in info['streams'] if s.get('codec_type') == 'video'), 1080)
+
+        # glow-edge: full-frame overlay at (0,0) matching video size
+        if self.style_name == "glow-edge":
+            width = vid_w
+            height = vid_h
+            y_position = 0
+        elif y_position is None:
             y_position = vid_h - height
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -204,6 +213,7 @@ class WaveGlow:
                 elif self.style_name == "envelope":
                     frame = self.renderer.render_frame(fi, env, width, height, self.fps)
                 else:
+                    # plasma, glow-edge, and any future styles that take (fi, amp, W, H, fps)
                     frame = self.renderer.render_frame(fi, amp, width, height, self.fps)
 
                 if self.opacity < 1.0:
