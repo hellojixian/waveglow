@@ -680,8 +680,8 @@ class GlowBottomWaveStyle:
             wave_alpha_gpu = wave_alpha_gpu + line_mask * weight
 
         wave_alpha_gpu = wave_alpha_gpu.clamp(0.0, 1.0)
-        # Wave always visible (base 0.4 alpha), amplitude drives extra brightness
-        wave_frame_alpha = 0.4 + 0.4 * t_amp
+        # Wave always visible (base 0.2 alpha), amplitude drives extra brightness
+        wave_frame_alpha = 0.2 + 0.2 * t_amp
         alpha_wave = wave_alpha_gpu * wave_frame_alpha
 
         # ---- Combine: single color (glow + wave share same color) ----
